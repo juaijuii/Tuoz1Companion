@@ -1,0 +1,12 @@
+# 打包产物
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# 运行时生成（含用户令牌，切勿提交）
+companion_config.json
+companion_config.json.tmp
+companion.log
+dump/
