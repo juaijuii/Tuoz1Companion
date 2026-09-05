@@ -26,11 +26,12 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 PROTOCOL_VERSION = 1
 
 IS_WINDOWS = sys.platform.startswith("win")
@@ -286,9 +287,12 @@ class BotAPI:
         self.server = server.rstrip("/")
         self.headers = {"Authorization": f"Bearer {token}"}
 
-    def ping(self) -> dict:
+    def ping(self, game_name: str = "", tag_line: str = "") -> dict:
         # 机器人第一次响应时要去数据库拉每个服务器的绑定，可能要几十秒
-        return _http_json("GET", self.server + "/api/companion/ping", self.headers, timeout=90) or {}
+        url = self.server + "/api/companion/ping"
+        if game_name and tag_line:
+            url += "?" + urllib.parse.urlencode({"game_name": game_name, "tag_line": tag_line})
+        return _http_json("GET", url, self.headers, timeout=90) or {}
 
     def post_match(self, payload: dict) -> dict:
         return _http_json("POST", self.server + "/api/companion/match", self.headers, body=payload, timeout=60) or {}
@@ -372,10 +376,22 @@ class Companion:
         name = summoner.get("gameName") or summoner.get("displayName") or "?"
         tag = summoner.get("tagLine") or ""
         logger.info(f"已连接英雄联盟客户端: {name}#{tag} (英雄数据 {len(self.champions)} 个)")
-        # 客户端的 puuid 和机器人（Riot 公开 API）的 puuid 不是同一个值，按游戏名比对
-        bound_names = {str(b.get("game_name") or "").strip().lower() for b in self.bindings}
-        if self.bindings and str(name).strip().lower() not in bound_names:
-            logger.warning(f"当前登录的账号 {name}#{tag} 没有在机器人上绑定，打完的比赛会被机器人忽略。")
+        # 让机器人用 Riot 账号接口判断当前账号是否绑定（改过名也能识别）；机器人不支持时退回按游戏名比对
+        bound = None
+        try:
+            info = self.bot.ping(name, tag)
+            if "current_bound" in info:
+                bound = bool(info["current_bound"])
+                if bound and info.get("current_bound_as") and str(info["current_bound_as"]).lower() != str(name).lower():
+                    logger.info(f"当前账号在机器人上绑定的名字是 {info['current_bound_as']}（你改过名，不影响使用）")
+        except Exception as e:
+            logger.debug(f"查询绑定状态失败: {e}")
+        if bound is None:
+            bound_names = {str(b.get("game_name") or "").strip().lower() for b in self.bindings}
+            bound = (not self.bindings) or str(name).strip().lower() in bound_names
+        if self.bindings and not bound:
+            logger.warning(f"当前登录的账号 {name}#{tag} 没有在机器人上绑定，打完的比赛会被机器人忽略。"
+                           f"请在 Discord 用 /bind {name}#{tag} 绑定。")
         self.next_history_check = 0.0
         return True
 
