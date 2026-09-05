@@ -31,7 +31,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 PROTOCOL_VERSION = 1
 
 IS_WINDOWS = sys.platform.startswith("win")
@@ -40,6 +40,10 @@ APP_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else Path(__file__)
 CONFIG_PATH = APP_DIR / "companion_config.json"
 LOG_PATH = APP_DIR / "companion.log"
 
+UPDATE_REPO = "juaijuii/Tuoz1Companion"
+UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+UPDATE_ASSET = "Tuoz1Companion.exe"
+UPDATE_CHECK_SECONDS = 6 * 3600
 IN_GAME_PHASES = {"InProgress", "Reconnect"}
 EOG_PHASES = {"WaitingForStats", "PreEndOfGame", "EndOfGame"}
 EOG_WAIT_SECONDS = 150   # 游戏结束后最多等这么久拿赛后统计（治疗/护盾队友），超时就不带它上报
@@ -300,6 +304,123 @@ class BotAPI:
 
 
 # ----------------------------------------------------------------------------
+# 自动更新（只对打包成 exe 的形态生效）
+# ----------------------------------------------------------------------------
+def parse_version(text: str) -> tuple:
+    nums = re.findall(r"\d+", str(text or ""))
+    return tuple(int(n) for n in nums[:3]) or (0,)
+
+
+def cleanup_old_binary() -> None:
+    """新版本启动后，把上一版留下的 .old 文件删掉"""
+    if not IS_FROZEN:
+        return
+    old = Path(sys.executable).with_suffix(".old.exe")
+    for _ in range(5):
+        try:
+            if old.exists():
+                old.unlink()
+            return
+        except OSError:
+            time.sleep(1)
+
+
+def fetch_latest_release() -> tuple[str, str, int] | None:
+    """返回 (版本号, exe 下载地址, 大小)；没有可用版本返回 None"""
+    data = _http_json("GET", UPDATE_API, {"Accept": "application/vnd.github+json"}, timeout=20)
+    if not isinstance(data, dict):
+        return None
+    tag = data.get("tag_name") or ""
+    for asset in data.get("assets") or []:
+        if asset.get("name") == UPDATE_ASSET and asset.get("browser_download_url"):
+            return tag, asset["browser_download_url"], int(asset.get("size") or 0)
+    return None
+
+
+def download_file(url: str, dest: Path, expected_size: int = 0) -> None:
+    req = urllib.request.Request(url, headers={"User-Agent": f"tuoz1-companion/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as f:
+        while True:
+            chunk = resp.read(1024 * 256)
+            if not chunk:
+                break
+            f.write(chunk)
+    size = dest.stat().st_size
+    if expected_size and size != expected_size:
+        raise RuntimeError(f"下载不完整：{size} / {expected_size} 字节")
+    with open(dest, "rb") as f:
+        if f.read(2) != b"MZ":
+            raise RuntimeError("下载的文件不是 Windows 可执行文件")
+
+
+def check_for_update(enabled: bool = True) -> bool:
+    """有新版本时下载并切换到新版本（返回 True 表示当前进程应立即退出）"""
+    if not enabled:
+        return False
+    try:
+        latest = fetch_latest_release()
+    except Exception as e:
+        logger.debug(f"检查更新失败: {e}")
+        return False
+    if not latest:
+        return False
+    tag, url, size = latest
+    if parse_version(tag) <= parse_version(VERSION):
+        logger.debug(f"已是最新版本（{VERSION}，最新 {tag}）")
+        return False
+    if not IS_FROZEN:
+        logger.info(f"有新版本 {tag}（当前 {VERSION}），源码运行不会自动替换，请到 GitHub 下载：{url}")
+        return False
+
+    logger.info(f"发现新版本 {tag}（当前 {VERSION}），正在下载更新...")
+    exe = Path(sys.executable)
+    new_file = exe.with_suffix(".new.exe")
+    old_file = exe.with_suffix(".old.exe")
+    try:
+        download_file(url, new_file, size)
+        if old_file.exists():
+            old_file.unlink()
+        os.rename(exe, old_file)      # Windows 允许给正在运行的 exe 改名
+        os.rename(new_file, exe)
+    except Exception as e:
+        logger.error(f"更新失败，继续使用当前版本: {e}")
+        try:
+            if new_file.exists():
+                new_file.unlink()
+            if not exe.exists() and old_file.exists():
+                os.rename(old_file, exe)
+        except OSError:
+            pass
+        return False
+
+    logger.info(f"已更新到 {tag}，正在重新启动...")
+    try:
+        args = [str(exe)] + [a for a in sys.argv[1:] if a != "--send-latest"]
+        # PyInstaller 会把 _PYI_ARCHIVE_FILE / _MEIPASS2 等变量留在环境里，新版本继承后会去找已被改名的旧文件而直接退出，
+        # 这里从当前进程环境里彻底删掉（本进程已经解包完成，不再需要它们）
+        for key in list(os.environ):
+            if key.startswith("_PYI_") or key == "_MEIPASS2":
+                os.environ.pop(key, None)
+        env = dict(os.environ)
+        kwargs = {"cwd": str(exe.parent), "env": env, "close_fds": True}
+        if IS_WINDOWS:
+            kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+        child = subprocess.Popen(args, **kwargs)
+        time.sleep(3)
+        if child.poll() is not None:
+            logger.warning(f"新版本进程退出了（返回码 {child.returncode}），改用系统方式启动")
+            if IS_WINDOWS:
+                os.startfile(str(exe))
+            else:
+                subprocess.Popen(args, cwd=str(exe.parent), env=env, start_new_session=True)
+            time.sleep(2)
+    except Exception as e:
+        logger.error(f"启动新版本失败，请手动双击 {exe.name}: {e}")
+        return False
+    return True
+
+
+# ----------------------------------------------------------------------------
 # 主逻辑
 # ----------------------------------------------------------------------------
 class Companion:
@@ -322,6 +443,7 @@ class Companion:
         self.eog_cache: dict[int, dict[str, dict]] = {}   # gameId -> {puuid: 赛后统计补充字段}
         self.eog_wait_until = 0.0                          # 游戏结束后等待赛后统计的截止时间
         self.next_retry_check = 0.0                        # 补报（不在语音频道）的下一次尝试时间，固定 60 秒间隔
+        self.next_update_check = time.time() + UPDATE_CHECK_SECONDS
         self.config.setdefault("last_game_ids", {})
         self.config.setdefault("sent_game_ids", [])
 
@@ -643,6 +765,12 @@ class Companion:
                     any(g not in self.eog_cache for g in self.pending_game_ids):
                 self.collect_eog()
 
+            if (now >= self.next_update_check and phase not in IN_GAME_PHASES
+                    and not self.pending_game_ids and not self.retry_uploads):
+                self.next_update_check = now + UPDATE_CHECK_SECONDS
+                if check_for_update(not self.args.no_update):
+                    return  # 已切换到新版本，本进程退出
+
             if now >= self.next_history_check:
                 try:
                     # 账号切换检测
@@ -705,11 +833,15 @@ def main() -> int:
     parser.add_argument("--send-latest", action="store_true", help="启动后立刻把最近一场比赛上报一次（用于测试）")
     parser.add_argument("--dump-dir", help="把上报的数据另存到此目录（调试用）")
     parser.add_argument("--reset", action="store_true", help="清除已保存的配置并重新设置")
+    parser.add_argument("--no-update", action="store_true", help="不自动检查/安装新版本")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
     setup_logging(args.verbose)
     logger.info(f"{APP_NAME} v{VERSION} — Tuoz1 Bot 客户端插件  (配置: {CONFIG_PATH})")
+    cleanup_old_binary()
+    if check_for_update(not args.no_update):
+        return 0
 
     config = {} if args.reset else load_config()
     if args.server:
