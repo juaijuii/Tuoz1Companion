@@ -31,7 +31,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 PROTOCOL_VERSION = 1
 
 IS_WINDOWS = sys.platform.startswith("win")
@@ -46,6 +46,7 @@ EOG_WAIT_SECONDS = 150   # 游戏结束后最多等这么久拿赛后统计（�
 POST_GAME_FAST_POLL_SECONDS = 5      # 游戏刚结束后每 5 秒查一次战绩
 POST_GAME_WINDOW_SECONDS = 15 * 60   # 结束后最多快查 15 分钟
 RETRY_WINDOW_SECONDS = 30 * 60       # 不在语音频道时，最多等 30 分钟补报
+RETRY_INTERVAL_SECONDS = 60          # 补报重试间隔（不跟随游戏结束后的快速轮询）
 PHASE_POLL_SECONDS = 3
 
 logger = logging.getLogger("tuoz1-companion")
@@ -320,6 +321,7 @@ class Companion:
         self.retry_uploads: dict[int, tuple[dict, str, float]] = {}  # 因不在语音频道被跳过的比赛: gameId -> (payload, match_id, 截止时间)
         self.eog_cache: dict[int, dict[str, dict]] = {}   # gameId -> {puuid: 赛后统计补充字段}
         self.eog_wait_until = 0.0                          # 游戏结束后等待赛后统计的截止时间
+        self.next_retry_check = 0.0                        # 补报（不在语音频道）的下一次尝试时间，固定 60 秒间隔
         self.config.setdefault("last_game_ids", {})
         self.config.setdefault("sent_game_ids", [])
 
@@ -526,6 +528,9 @@ class Companion:
             self.mark_sent(game_id)
 
     def process_retries(self) -> None:
+        if not self.retry_uploads or time.time() < self.next_retry_check:
+            return
+        self.next_retry_check = time.time() + RETRY_INTERVAL_SECONDS
         for game_id, (payload, match_id, deadline) in list(self.retry_uploads.items()):
             if time.time() > deadline:
                 logger.info(f"比赛 {match_id} 超过补报时限，放弃。")
