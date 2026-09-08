@@ -31,7 +31,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 PROTOCOL_VERSION = 1
 
 IS_WINDOWS = sys.platform.startswith("win")
@@ -235,6 +235,9 @@ class LCU:
 
     def current_summoner(self) -> dict:
         return self.get("/lol-summoner/v1/current-summoner") or {}
+
+    def summoner_by_puuid(self, puuid: str) -> dict:
+        return self.get(f"/lol-summoner/v2/summoners/puuid/{puuid}", timeout=10) or {}
 
     def champion_map(self) -> dict[str, str]:
         data = self.get("/lol-game-data/assets/v1/champion-summary.json") or []
@@ -460,8 +463,8 @@ class Companion:
                 break
             except HttpError as e:
                 if e.status == 401:
-                    logger.error("机器人拒绝了这个令牌（401）。请在 Discord 用 /companion_token 重新获取令牌。")
-                    return False
+                    logger.error("机器人拒绝了这个令牌（401）。请在 Discord 用 /companion_token 查看令牌。")
+                    return "unauthorized"
                 logger.warning(f"连接机器人失败（第 {attempt} 次）: {e}")
             except Exception as e:
                 logger.warning(f"连接机器人失败（第 {attempt} 次）: {e}")
@@ -549,11 +552,23 @@ class Companion:
                 if not mine:
                     continue
                 for t in entries:
-                    name = entry_name(t)
-                    if not name or t.get("puuid") == my_puuid or name.lower() == my_name:
+                    if t.get("puuid") == my_puuid:
                         continue
-                    teammates.append({"game_name": name, "tag_line": str(t.get("tagLine") or "").strip()})
+                    name = entry_name(t)
+                    tag = str(t.get("tagLine") or "").strip()
+                    if (not name or not tag) and t.get("puuid"):
+                        # 新版客户端的对局数据里往往没有名字，按 puuid 再查一次
+                        try:
+                            info = self.lcu.summoner_by_puuid(str(t["puuid"]))
+                            name = str(info.get("gameName") or name or "").strip()
+                            tag = str(info.get("tagLine") or tag or "").strip()
+                        except Exception as e:
+                            logger.debug(f"查询队友 {t.get('puuid')} 失败: {e}")
+                    if not name or name.lower() == my_name:
+                        continue
+                    teammates.append({"game_name": name, "tag_line": tag})
                 break
+            logger.info("同队队友: " + (", ".join(f"{t['game_name']}#{t['tag_line']}" for t in teammates) or "（对局数据里没有队友信息）"))
             try:
                 _, platform = self.lcu.latest_match_summary()
             except Exception:
@@ -919,8 +934,18 @@ def main() -> int:
 
     bot = BotAPI(config["server"], config["token"])
     companion = Companion(config, bot, args)
-    if not companion.check_bot():
-        return 1
+    while True:
+        status = companion.check_bot()
+        if status is True:
+            break
+        if status != "unauthorized":
+            return 1
+        new_token = prompt("请粘贴新的令牌（在 Discord 输入 /companion_token 查看；直接回车退出）: ")
+        if not new_token:
+            return 1
+        config["token"] = new_token
+        save_config(config)
+        bot.headers = {"Authorization": f"Bearer {new_token}"}
     try:
         companion.run()
     except KeyboardInterrupt:
