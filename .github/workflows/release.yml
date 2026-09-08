@@ -1,0 +1,61 @@
+name: Release
+
+# 推一个 v* 的 tag 就会：在 GitHub 的 Windows 机器上用 PyInstaller 打包 exe，
+# 然后自动创建 Release，说明取 RELEASE_NOTES_<tag>.md，附件为 Tuoz1Companion.exe。
+# 正在运行的插件检测到新 Release 会自动更新。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（如 v1.3.1，必须已存在）"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装 PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: 检查版本号和 tag 一致
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VER=$(grep -oP '^VERSION = "\K[^"]+' tuoz1_companion.py)
+          if [ "v$VER" != "$TAG" ]; then
+            echo "tuoz1_companion.py 里 VERSION=$VER，和 tag $TAG 不一致，先改版本号再打 tag"
+            exit 1
+          fi
+          if [ ! -f "RELEASE_NOTES_$TAG.md" ]; then
+            echo "没有 RELEASE_NOTES_$TAG.md，用 CHANGELOG 顶部段落代替"
+            awk 'NR>1 && /^## /{n++} n<2' CHANGELOG.md > "RELEASE_NOTES_$TAG.md"
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: 打包 exe
+        run: python -m PyInstaller --onefile --console --clean --name Tuoz1Companion tuoz1_companion.py
+
+      - name: 自检 exe 能启动
+        run: dist\Tuoz1Companion.exe --help
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          body_path: RELEASE_NOTES_${{ env.TAG }}.md
+          files: dist/Tuoz1Companion.exe
+          prerelease: ${{ contains(env.TAG, '-') }}
