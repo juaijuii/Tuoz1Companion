@@ -31,7 +31,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 PROTOCOL_VERSION = 1
 
 IS_WINDOWS = sys.platform.startswith("win")
@@ -302,6 +302,9 @@ class BotAPI:
     def post_match(self, payload: dict) -> dict:
         return _http_json("POST", self.server + "/api/companion/match", self.headers, body=payload, timeout=60) or {}
 
+    def post_game_start(self, payload: dict) -> dict:
+        return _http_json("POST", self.server + "/api/companion/game_start", self.headers, body=payload, timeout=30) or {}
+
 
 # ----------------------------------------------------------------------------
 # 自动更新（只对打包成 exe 的形态生效）
@@ -526,6 +529,59 @@ class Companion:
         self.summoner = {}
         self.last_phase = None
 
+    # --- 开局通知（机器人据此开赌局）---
+    def notify_game_start(self, game_id: int) -> None:
+        """进入对局时把 gameId、模式和同队队友告诉机器人。失败只记日志，不影响其它功能。"""
+        try:
+            session = self.lcu.get("/lol-gameflow/v1/session") or {}
+            game_data = session.get("gameData") or {}
+            queue = game_data.get("queue") or {}
+            my_puuid = self.summoner.get("puuid") or ""
+            my_name = str(self.summoner.get("gameName") or "").strip().lower()
+
+            def entry_name(t: dict) -> str:
+                return str(t.get("gameName") or t.get("summonerName") or t.get("summonerInternalName") or "").strip()
+
+            teammates = []
+            for team in (game_data.get("teamOne") or [], game_data.get("teamTwo") or []):
+                entries = [t for t in team if isinstance(t, dict)]
+                mine = any(t.get("puuid") == my_puuid or entry_name(t).lower() == my_name for t in entries)
+                if not mine:
+                    continue
+                for t in entries:
+                    name = entry_name(t)
+                    if not name or t.get("puuid") == my_puuid or name.lower() == my_name:
+                        continue
+                    teammates.append({"game_name": name, "tag_line": str(t.get("tagLine") or "").strip()})
+                break
+            try:
+                _, platform = self.lcu.latest_match_summary()
+            except Exception:
+                platform = ""
+            payload = {
+                "companion_version": VERSION,
+                "game_id": game_id,
+                "platform": str(platform or "").upper(),
+                "game_name": self.summoner.get("gameName") or "",
+                "tag_line": self.summoner.get("tagLine") or "",
+                "game_mode": queue.get("gameMode") or "",
+                "queue_id": queue.get("id") if isinstance(queue.get("id"), int) else None,
+                "teammates": teammates,
+            }
+            resp = self.bot.post_game_start(payload)
+            opened = resp.get("opened") or []
+            if opened:
+                logger.info(f"已通知机器人开局，赌局在 {', '.join(opened)} 开盘（队友 {len(teammates)} 人）")
+            else:
+                logger.info(f"已通知机器人开局（{resp.get('ignored') or '没有需要开盘的服务器'}）")
+        except HttpError as e:
+            if e.status == 404:
+                logger.debug("机器人版本还不支持开局通知")
+            else:
+                logger.warning(f"通知机器人开局失败: {e}")
+        except Exception as e:
+            logger.warning(f"通知机器人开局失败: {e}")
+
     # --- 战绩 ---
     def already_sent(self, game_id: int) -> bool:
         return game_id in self.config["sent_game_ids"]
@@ -744,6 +800,7 @@ class Companion:
                     self.current_game_id = self.lcu.current_game_id()
                     if self.current_game_id:
                         logger.info(f"对局进行中: gameId {self.current_game_id}")
+                        self.notify_game_start(self.current_game_id)
                 except Exception as e:
                     logger.debug(f"读取对局信息失败: {e}")
 
