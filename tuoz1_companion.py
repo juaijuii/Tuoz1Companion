@@ -31,7 +31,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 PROTOCOL_VERSION = 1
 
 IS_WINDOWS = sys.platform.startswith("win")
@@ -443,6 +443,7 @@ class Companion:
         self.next_history_check = 0.0
         self.last_lcu_warn = 0.0
         self.send_latest_once = bool(args.send_latest)
+        self.last_reauth_prompt = 0.0
         self.current_game_id: int | None = None   # 正在打的对局
         self.pending_game_ids: list[int] = []      # 已结束、等待战绩生成的对局
         self.retry_uploads: dict[int, tuple[dict, str, float]] = {}  # 因不在语音频道被跳过的比赛: gameId -> (payload, match_id, 截止时间)
@@ -597,6 +598,23 @@ class Companion:
         except Exception as e:
             logger.warning(f"通知机器人开局失败: {e}")
 
+    def reauthorize(self) -> bool:
+        """运行中令牌失效（比如在 Discord 重新生成了令牌）：当场让用户粘贴新令牌，不用重启"""
+        now = time.time()
+        if now - self.last_reauth_prompt < 300:
+            return False          # 5 分钟内问过了，别反复弹
+        self.last_reauth_prompt = now
+        logger.error("机器人拒绝了当前令牌（401）。可能是在 Discord 重新生成过令牌。")
+        new_token = prompt("请粘贴新的令牌（在 Discord 输入 /companion_token 查看；直接回车先跳过）: ")
+        if not new_token:
+            logger.warning("没有输入新令牌，接下来的上报会先排队，5 分钟后再问一次。")
+            return False
+        self.config["token"] = new_token
+        save_config(self.config)
+        self.bot.headers = {"Authorization": f"Bearer {new_token}"}
+        logger.info("令牌已更新。")
+        return True
+
     # --- 战绩 ---
     def already_sent(self, game_id: int) -> bool:
         return game_id in self.config["sent_game_ids"]
@@ -713,6 +731,8 @@ class Companion:
             dump.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             logger.info(f"已保存比赛数据到 {dump}")
         outcome = self.upload(payload, match_id)
+        if outcome == "unauthorized":
+            outcome = self.upload(payload, match_id) if self.reauthorize() else "retry"
         if outcome == "retry":
             # 还没进语音频道: 30 分钟内每分钟重试一次，进了语音就会补播
             self.retry_uploads[game_id] = (payload, match_id, time.time() + RETRY_WINDOW_SECONDS)
@@ -731,6 +751,10 @@ class Companion:
                 self.mark_sent(game_id)
                 continue
             outcome = self.upload(payload, match_id, quiet=True)
+            if outcome == "unauthorized":
+                if not self.reauthorize():
+                    continue          # 没给新令牌：留在补报队列里下次再试
+                outcome = self.upload(payload, match_id, quiet=True)
             if outcome == "retry":
                 continue
             self.retry_uploads.pop(game_id, None)
@@ -744,8 +768,7 @@ class Companion:
                 resp = self.bot.post_match(payload)
             except HttpError as e:
                 if e.status == 401:
-                    logger.error("令牌已失效（401），请重新用 /companion_token 获取令牌后修改 companion_config.json。")
-                    return False
+                    return "unauthorized"
                 if e.status == 422:
                     logger.warning(f"机器人：这个账号没有绑定，忽略比赛 {match_id}。")
                     return True
