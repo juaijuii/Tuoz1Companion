@@ -8,10 +8,9 @@ tuoz1_companion.py — Tuoz1 Bot 客户端插件（Tuoz1 Companion）
 
 只依赖 Python 标准库，可直接 `python tuoz1_companion.py` 运行，也可以用 PyInstaller 打包成 exe。
 
-首次运行会提示输入：
-  1. 机器人地址（例如 http://1.2.3.4:25570）
-  2. 在 Discord 里用 /companion_token 获取的令牌
-配置保存在同目录的 companion_config.json。
+机器人地址固定为 SERVER_URL（v1.4.0 起写死在代码里，玩家不需要也不能自己填；
+旧配置文件里保存的地址会在启动时被覆盖）。首次运行只提示输入在 Discord 里用
+/companion_token 获取的令牌，配置保存在同目录的 companion_config.json。
 """
 from __future__ import annotations
 
@@ -31,8 +30,9 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 PROTOCOL_VERSION = 1
+SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
 IS_WINDOWS = sys.platform.startswith("win")
 IS_FROZEN = bool(getattr(sys, "frozen", False))
@@ -471,7 +471,7 @@ class Companion:
                 logger.warning(f"连接机器人失败（第 {attempt} 次）: {e}")
             time.sleep(5)
         if info is None:
-            logger.error("多次连接机器人失败。请检查机器人地址是否正确、端口是否开放，或机器人是否在线。")
+            logger.error("多次连接机器人失败。请检查本机网络是否正常，或机器人是否在线（地址已内置在插件里，不需要自己填）。")
             return False
         self.bindings = info.get("bindings") or []
         if not self.bindings:
@@ -922,12 +922,12 @@ def setup_logging(verbose: bool) -> None:
 def main() -> int:
     setup_console_utf8()
     parser = argparse.ArgumentParser(description=f"{APP_NAME} — Tuoz1 Bot 客户端插件")
-    parser.add_argument("--server", help="机器人地址，例如 http://1.2.3.4:25570")
+    parser.add_argument("--server", help=f"调试用：临时覆盖机器人地址（默认 {SERVER_URL}），不写入配置文件")
     parser.add_argument("--token", help="/companion_token 获取的令牌")
     parser.add_argument("--interval", type=int, default=60, help="平时检查新战绩的间隔（秒），默认 60")
     parser.add_argument("--send-latest", action="store_true", help="启动后立刻把最近一场比赛上报一次（用于测试）")
     parser.add_argument("--dump-dir", help="把上报的数据另存到此目录（调试用）")
-    parser.add_argument("--reset", action="store_true", help="清除已保存的配置并重新设置")
+    parser.add_argument("--reset", action="store_true", help="清除已保存的令牌并重新输入")
     parser.add_argument("--no-update", action="store_true", help="不自动检查/安装新版本")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
@@ -938,24 +938,30 @@ def main() -> int:
     if check_for_update(not args.no_update):
         return 0
 
-    config = {} if args.reset else load_config()
-    if args.server:
-        config["server"] = args.server
+    config = load_config()
+    if args.reset:
+        config.pop("token", None)
     if args.token:
         config["token"] = args.token
+    # 机器人地址一律以代码里的 SERVER_URL 为准：老用户的配置文件里存的是旧服务器的 IP，
+    # 必须无条件覆盖并写回，否则搬家之后他们的插件会一直连不上
+    if config.get("server") != SERVER_URL:
+        if config.get("server"):
+            logger.info(f"机器人地址已更新：{config['server']} → {SERVER_URL}")
+        config["server"] = SERVER_URL
 
-    if not config.get("server"):
-        config["server"] = prompt("请输入机器人地址（例如 http://1.2.3.4:25570）: ")
     if not config.get("token"):
         config["token"] = prompt("请输入 /companion_token 获取的令牌: ")
-    if not config.get("server") or not config.get("token"):
-        logger.error("缺少机器人地址或令牌。")
+    if not config.get("token"):
+        logger.error("缺少令牌。")
         return 2
-    if not config["server"].startswith(("http://", "https://")):
-        config["server"] = "http://" + config["server"]
     save_config(config)
 
-    bot = BotAPI(config["server"], config["token"])
+    server = SERVER_URL
+    if args.server:      # 调试用的临时覆盖：只在这次运行生效，不写进配置文件
+        server = args.server if args.server.startswith(("http://", "https://")) else "http://" + args.server
+        logger.warning(f"[调试] 本次临时连接 {server}（不会保存）")
+    bot = BotAPI(server, config["token"])
     companion = Companion(config, bot, args)
     while True:
         status = companion.check_bot()

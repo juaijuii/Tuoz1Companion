@@ -11,8 +11,9 @@
 
 ## 使用方法
 
-1. 在 Discord 里先 `/bind` 绑定账号，再输入 `/companion_token`，机器人会私下回复 **机器人地址** 和 **令牌**。
-2. 双击运行 `Tuoz1Companion.exe`，按提示粘贴地址和令牌，只需输入一次（保存在同目录的 `companion_config.json`）。
+1. 在 Discord 里先 `/bind` 绑定账号，再输入 `/companion_token`，机器人会私下回复 **令牌**。
+2. 双击运行 `Tuoz1Companion.exe`，按提示粘贴令牌，只需输入一次（保存在同目录的 `companion_config.json`）。
+   机器人地址已经内置在插件里，不需要也不能自己填。
 3. 打游戏时保持插件窗口开着。打完一局后，插件会等客户端生成战绩（通常几十秒），然后自动上报。
 4. 和平时一样，待在语音频道里机器人才会播报。打完时不在语音也没关系，30 分钟内进语音会自动补播。
 
@@ -28,7 +29,7 @@ python tuoz1_companion.py
 
 ```bash
 python tuoz1_companion.py --send-latest    # 启动后立刻把最近一场比赛上报一次（测试用）
-python tuoz1_companion.py --reset          # 重新输入地址和令牌
+python tuoz1_companion.py --reset          # 重新输入令牌
 python tuoz1_companion.py --dump-dir dump  # 把上报的数据另存一份（排查问题用）
 python tuoz1_companion.py -v               # 详细日志
 ```
