@@ -30,7 +30,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -51,6 +51,7 @@ POST_GAME_FAST_POLL_SECONDS = 5      # 游戏刚结束后每 5 秒查一次战�
 POST_GAME_WINDOW_SECONDS = 15 * 60   # 结束后最多快查 15 分钟
 RETRY_WINDOW_SECONDS = 30 * 60       # 不在语音频道时，最多等 30 分钟补报
 RETRY_INTERVAL_SECONDS = 60          # 补报重试间隔（不跟随游戏结束后的快速轮询）
+STALE_HISTORY_SECONDS = 12 * 3600    # 战绩列表里的「最新一场」超过这么久就不补报了（只记成基线）
 PHASE_POLL_SECONDS = 3
 
 logger = logging.getLogger("tuoz1-companion")
@@ -697,6 +698,21 @@ class Companion:
                 self.config["last_game_ids"][puuid] = game_id
                 save_config(self.config)
                 logger.info(f"以比赛 {platform}_{game_id} 为基线，之后的新比赛会自动上报。")
+                return
+            # 「和上次不一样」不等于「比上次新」。斗魂竞技场这类模式不进战绩列表（或列表还没刷新），
+            # 打完一局竞技场后，列表里的最新一场还是很久以前的那场，以前会被当成新比赛报上去。
+            # 同一个大区里 gameId 是递增的：比上次的小，就一定不是新比赛
+            if isinstance(last_id, int) and game_id < last_id:
+                logger.debug(f"战绩列表最新一场 {game_id} 比已上报的 {last_id} 还旧，跳过")
+                return
+            # 隔了很久才开插件：那场比赛早就过去了，别再进语音念一遍，只记成基线
+            created = summary.get("gameCreation")
+            if isinstance(created, (int, float)) and created > 0 and \
+                    time.time() - created / 1000 > STALE_HISTORY_SECONDS:
+                self.config["last_game_ids"][puuid] = game_id
+                save_config(self.config)
+                logger.info(f"比赛 {platform}_{game_id} 是 {int((time.time() - created / 1000) // 3600)} 小时前的，"
+                            f"不再补报，以它为新基线。")
                 return
         self.send_latest_once = False
 
