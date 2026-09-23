@@ -36,6 +36,10 @@ python tuoz1_companion.py -v               # 详细日志
 
 日志写在同目录的 `companion.log`。
 
+## 批量导入黑名单
+
+把 League Akari 导出的「标记玩家」JSON 直接拖到 `Tuoz1Companion.exe` 图标上（或 `python tuoz1_companion.py --import-blacklist 文件`）。插件通过已登录的客户端把 puuid 换成名字，列出你绑定过的服务器让你选，然后发给机器人存进黑名单。只有你是管理员的服务器才能导入；已经在黑名单里的人只更新备注，新名字每条约 1.3 秒。
+
 从 v1.2.0 起插件会自动更新：启动时和每 6 小时检查一次新版本，自动下载替换并重启，配置和令牌不受影响。不想自动更新加 `--no-update`。
 
 ## 工作原理

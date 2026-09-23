@@ -11,6 +11,10 @@ tuoz1_companion.py — Tuoz1 Bot 客户端插件（Tuoz1 Companion）
 机器人地址固定为 SERVER_URL（v1.4.0 起写死在代码里，玩家不需要也不能自己填；
 旧配置文件里保存的地址会在启动时被覆盖）。首次运行只提示输入在 Discord 里用
 /companion_token 获取的令牌，配置保存在同目录的 companion_config.json。
+
+批量导入黑名单（v1.5.0）：把 League Akari 导出的「标记玩家」JSON 拖到 exe 图标上，
+或者 `tuoz1_companion.py --import-blacklist 文件`。插件通过客户端把 puuid 换成名字，
+再发给机器人存进你选的服务器的黑名单（要求你是那个服务器的管理员）。
 """
 from __future__ import annotations
 
@@ -30,7 +34,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -308,6 +312,10 @@ class BotAPI:
 
     def post_game_start(self, payload: dict) -> dict:
         return _http_json("POST", self.server + "/api/companion/game_start", self.headers, body=payload, timeout=30) or {}
+
+    def post_blacklist_import(self, payload: dict) -> dict:
+        # 一批最多 25 条，机器人那边每条要查一次 Riot（1.3 秒），所以超时给足
+        return _http_json("POST", self.server + "/api/companion/blacklist_import", self.headers, body=payload, timeout=180) or {}
 
 
 # ----------------------------------------------------------------------------
@@ -935,6 +943,173 @@ def setup_logging(verbose: bool) -> None:
         pass
 
 
+# ----------------------------------------------------------------------------
+# 批量导入黑名单（把文件拖到 exe 上）
+# ----------------------------------------------------------------------------
+IMPORT_BATCH = 25
+
+
+def load_blacklist_file(path: Path) -> list[dict]:
+    """认两种文件：League Akari 的标记玩家导出（只有客户端 puuid + 备注），
+    或者已经带 riot_id 的列表 [{"riot_id": "名字#tag", "reason": "…"}]"""
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    if isinstance(data, dict):
+        data = data.get("data") or data.get("entries") or []
+    if not isinstance(data, list):
+        raise ValueError("文件里没有记录列表")
+    out = []
+    for e in data:
+        if not isinstance(e, dict):
+            continue
+        rid = str(e.get("riot_id") or e.get("riotId") or "").strip()
+        reason = str(e.get("reason") or e.get("tag") or e.get("note") or "").strip()
+        puuid = str(e.get("lcu_puuid") or e.get("puuid") or "").strip()
+        if rid or puuid:
+            out.append({"riot_id": rid, "reason": reason, "lcu_puuid": puuid})
+    return out
+
+
+def run_blacklist_import(path: Path, companion: "Companion", bot: "BotAPI") -> int:
+    print()
+    print("=" * 60)
+    print(f"批量导入黑名单：{path}")
+    print("=" * 60)
+    try:
+        entries = load_blacklist_file(path)
+    except Exception as e:
+        logger.error(f"读不了这个文件: {e}")
+        return 2
+    if not entries:
+        logger.error("文件里没有任何记录。")
+        return 2
+    # 同一个人可能被多个账号标记过：按 puuid / 名字去重，备注合并
+    merged: dict[str, dict] = {}
+    for e in entries:
+        key = (e["lcu_puuid"] or e["riot_id"]).lower()
+        m = merged.setdefault(key, {"riot_id": e["riot_id"], "reason": "", "lcu_puuid": e["lcu_puuid"]})
+        if e["reason"] and e["reason"] not in m["reason"].split("；"):
+            m["reason"] = (m["reason"] + "；" + e["reason"]).strip("；")
+        if e["riot_id"] and not m["riot_id"]:
+            m["riot_id"] = e["riot_id"]
+    entries = list(merged.values())
+    need_names = [e for e in entries if not e["riot_id"]]
+    logger.info(f"读到 {len(entries)} 个玩家，其中 {len(need_names)} 个只有客户端 puuid，要通过客户端查名字")
+
+    # 名字要靠客户端查：等客户端登录
+    if need_names:
+        waited = 0
+        while companion.lcu is None:
+            if companion.connect_lcu():
+                break
+            if waited == 0:
+                logger.info("请打开并登录英雄联盟客户端，最多等 3 分钟…")
+            time.sleep(5)
+            waited += 5
+            if waited >= 180:
+                logger.error("一直没等到客户端，放弃。")
+                return 2
+        failed_names = []
+        for i, e in enumerate(need_names, 1):
+            try:
+                summ = companion.lcu.summoner_by_puuid(e["lcu_puuid"])
+                name, tag = summ.get("gameName"), summ.get("tagLine")
+            except HttpError as err:
+                name, tag = None, f"HTTP {err.status}"
+            except Exception as err:
+                name, tag = None, str(err)[:60]
+            if name and tag:
+                e["riot_id"] = f"{name}#{tag}"
+                print(f"  [{i}/{len(need_names)}] {name}#{tag}  ← {e['reason'] or '无备注'}")
+            else:
+                failed_names.append((e["lcu_puuid"], tag))
+            time.sleep(0.15)
+        if failed_names:
+            logger.warning(f"{len(failed_names)} 个玩家在客户端查不到（多半是账号已注销或改区），跳过：")
+            for p, why in failed_names:
+                print(f"    {p}  {why}")
+        entries = [e for e in entries if e["riot_id"]]
+    if not entries:
+        logger.error("没有一条能用的记录。")
+        return 2
+
+    # 选服务器：从机器人拿这个令牌绑定过的服务器
+    try:
+        info = bot.ping()
+    except Exception as e:
+        logger.error(f"连不上机器人: {e}")
+        return 1
+    guilds: dict[str, str] = {}
+    for b in info.get("bindings") or []:
+        if b.get("guild_id") and b.get("guild_name"):
+            guilds.setdefault(str(b["guild_id"]), b["guild_name"])
+    if not guilds:
+        logger.error("你在机器人上还没绑定任何服务器，先在 Discord 里 /bind。")
+        return 2
+    ids = list(guilds)
+    print()
+    print("导入到哪个服务器？（只有你是管理员的服务器才会成功）")
+    for i, gid in enumerate(ids, 1):
+        print(f"  [{i}] {guilds[gid]}")
+    print("  [a] 全部")
+    choice = prompt("输入编号（多个用空格分开）或 a，直接回车取消: ").lower()
+    if not choice:
+        logger.info("已取消。")
+        return 0
+    if choice == "a":
+        chosen = ids
+    else:
+        chosen = []
+        for tok in choice.replace(",", " ").split():
+            if tok.isdigit() and 1 <= int(tok) <= len(ids):
+                chosen.append(ids[int(tok) - 1])
+        if not chosen:
+            logger.error("没选中任何服务器。")
+            return 2
+    logger.info(f"导入到：{'、'.join(guilds[g] for g in chosen)}；共 {len(entries)} 条，分 "
+                f"{(len(entries) + IMPORT_BATCH - 1) // IMPORT_BATCH} 批发送（新名字每条要 1.3 秒，已有的很快）")
+
+    totals: dict[str, dict] = {}
+    failed: list = []
+    denied: list = []
+    for start in range(0, len(entries), IMPORT_BATCH):
+        batch = entries[start:start + IMPORT_BATCH]
+        try:
+            resp = bot.post_blacklist_import({"guild_ids": chosen, "entries": batch})
+        except HttpError as e:
+            try:
+                detail = json.loads(e.body)
+            except Exception:
+                detail = {}
+            if detail.get("error") == "no_permission":
+                logger.error("机器人拒绝了：你不是所选服务器的管理员。")
+                for d in detail.get("denied") or []:
+                    print(f"    {d.get('guild_name') or d.get('guild_id')}：{d.get('why')}")
+                return 3
+            logger.error(f"第 {start // IMPORT_BATCH + 1} 批失败: {e}")
+            return 1
+        except Exception as e:
+            logger.error(f"第 {start // IMPORT_BATCH + 1} 批失败: {e}")
+            return 1
+        for g in resp.get("guilds") or []:
+            t = totals.setdefault(g["guild_id"], {"name": g["guild_name"], "added": 0, "updated": 0, "total": 0})
+            t["added"] += int(g.get("added") or 0)
+            t["updated"] += int(g.get("updated") or 0)
+            t["total"] = int(g.get("total") or t["total"])
+        failed.extend(resp.get("failed") or [])
+        denied = resp.get("denied") or denied
+        print(f"  已发送 {min(start + IMPORT_BATCH, len(entries))}/{len(entries)}")
+    print()
+    for t in totals.values():
+        logger.info(f"{t['name']}：新增 {t['added']}，更新 {t['updated']}，黑名单现在共 {t['total']} 人")
+    for d in denied:
+        logger.warning(f"{d.get('guild_name') or d.get('guild_id')}：{d.get('why')}")
+    if failed:
+        logger.warning(f"{len(failed)} 条没导进去：")
+        for f in failed:
+            print(f"    {f.get('riot_id')}：{f.get('why')}")
+    return 0
+
+
 def main() -> int:
     setup_console_utf8()
     parser = argparse.ArgumentParser(description=f"{APP_NAME} — Tuoz1 Bot 客户端插件")
@@ -945,6 +1120,8 @@ def main() -> int:
     parser.add_argument("--dump-dir", help="把上报的数据另存到此目录（调试用）")
     parser.add_argument("--reset", action="store_true", help="清除已保存的令牌并重新输入")
     parser.add_argument("--no-update", action="store_true", help="不自动检查/安装新版本")
+    parser.add_argument("--import-blacklist", metavar="文件", help="批量导入黑名单：League Akari 的标记玩家导出，或带 riot_id 的 JSON 列表")
+    parser.add_argument("file", nargs="?", help=argparse.SUPPRESS)   # 把文件拖到 exe 上时，路径就在这里
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -991,6 +1168,11 @@ def main() -> int:
         config["token"] = new_token
         save_config(config)
         bot.headers = {"Authorization": f"Bearer {new_token}"}
+    import_file = args.import_blacklist or args.file
+    if import_file:
+        code = run_blacklist_import(Path(import_file), companion, bot)
+        pause_before_exit()      # 拖文件启动的窗口会直接关掉，得让人看到结果
+        return code
     try:
         companion.run()
     except KeyboardInterrupt:
