@@ -34,7 +34,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -54,6 +54,7 @@ EOG_WAIT_SECONDS = 150   # 游戏结束后最多等这么久拿赛后统计（�
 POST_GAME_FAST_POLL_SECONDS = 5      # 游戏刚结束后每 5 秒查一次战绩
 POST_GAME_WINDOW_SECONDS = 15 * 60   # 结束后最多快查 15 分钟
 RETRY_WINDOW_SECONDS = 30 * 60       # 不在语音频道时，最多等 30 分钟补报
+FAIL_RETRY_WINDOW_SECONDS = 2 * 3600 # 上传失败（机器人重启 / 网络）时最多等 2 小时补报
 RETRY_INTERVAL_SECONDS = 60          # 补报重试间隔（不跟随游戏结束后的快速轮询）
 STALE_HISTORY_SECONDS = 12 * 3600    # 战绩列表里的「最新一场」超过这么久就不补报了（只记成基线）
 PHASE_POLL_SECONDS = 3
@@ -88,6 +89,22 @@ def prompt(text: str) -> str:
         return input(text).strip()
     except EOFError:
         return ""
+
+
+def prompt_with_timeout(text: str, seconds: float) -> str:
+    """最多等 seconds 秒的输入：后台没人看控制台时不能让主循环（看对局、补报）卡在 input() 上"""
+    import threading
+    box = {}
+
+    def _read():
+        try:
+            box["v"] = input(text).strip()
+        except EOFError:
+            box["v"] = ""
+    t = threading.Thread(target=_read, daemon=True)
+    t.start()
+    t.join(seconds)
+    return box.get("v", "")
 
 
 def pause_before_exit() -> None:
@@ -146,15 +163,20 @@ def find_lcu() -> tuple[int, str] | None:
         return 0, override  # 测试模式：由 COMPANION_LCU_BASE 决定地址
 
     if IS_WINDOWS:
+        # 系统工具一律用绝对路径：按裸名字调用时 CreateProcess 会先在 exe 自己的目录（通常是「下载」）找同名程序，
+        # 谁往那里放一个 powershell.exe 就能借插件的权限跑代码
+        sysroot = os.environ.get("SystemRoot") or r"C:\Windows"
+        powershell = os.path.join(sysroot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        wmic = os.path.join(sysroot, "System32", "wbem", "wmic.exe")
         # 1) PowerShell / CIM（最可靠）
         ps = ("Get-CimInstance Win32_Process -Filter \"Name='LeagueClientUx.exe'\" "
               "| Select-Object -ExpandProperty CommandLine")
-        out = _run_hidden(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps])
+        out = _run_hidden([powershell, "-NoProfile", "-NonInteractive", "-Command", ps]) if os.path.exists(powershell) else ""
         found = parse_client_command_line(out)
         if found:
             return found
-        # 2) wmic（老系统）
-        out = _run_hidden(["wmic", "PROCESS", "WHERE", "name='LeagueClientUx.exe'", "GET", "commandline"])
+        # 2) wmic（老系统；新版 Win11 已经没有了）
+        out = _run_hidden([wmic, "PROCESS", "WHERE", "name='LeagueClientUx.exe'", "GET", "commandline"]) if os.path.exists(wmic) else ""
         found = parse_client_command_line(out)
         if found:
             return found
@@ -273,12 +295,18 @@ EOG_FIELDS_UPPER = {"totalHealsOnTeammates": "TOTAL_HEAL_ON_TEAMMATES",
                     "totalHeal": "TOTAL_HEAL", "totalUnitsHealed": "TOTAL_UNITS_HEALED"}
 
 def extract_eog_stats(eog: dict) -> tuple[int | None, dict[str, dict]]:
-    """从赛后统计里抽出每个玩家的补充字段：返回 (gameId, {puuid: {...}})"""
+    """从赛后统计里抽出每个玩家的补充字段：返回 (gameId, {puuid: {...}})。客户端返回的结构不对就当没有"""
     result = {}
-    for team in eog.get("teams") or []:
-        for player in team.get("players") or []:
+    if not isinstance(eog, dict):
+        return None, result
+    teams = eog.get("teams") if isinstance(eog.get("teams"), list) else []
+    for team in teams:
+        players = team.get("players") if isinstance(team, dict) and isinstance(team.get("players"), list) else []
+        for player in players:
+            if not isinstance(player, dict):
+                continue
             puuid = player.get("puuid")
-            stats = player.get("stats") or {}
+            stats = player.get("stats") if isinstance(player.get("stats"), dict) else {}
             if not puuid:
                 continue
             entry = {}
@@ -399,13 +427,17 @@ def check_for_update(enabled: bool = True) -> bool:
         os.rename(new_file, exe)
     except Exception as e:
         logger.error(f"更新失败，继续使用当前版本: {e}")
+        # 回滚的两步分开 try：以前删 .new 失败（杀软锁文件）就跳过了「把旧 exe 改回来」，插件本体直接没了
         try:
             if new_file.exists():
                 new_file.unlink()
+        except OSError as e2:
+            logger.warning(f"清理半截的新文件失败: {e2}")
+        try:
             if not exe.exists() and old_file.exists():
                 os.rename(old_file, exe)
-        except OSError:
-            pass
+        except OSError as e2:
+            logger.error(f"把旧版本改回原名失败，请手动把 {old_file.name} 改成 {exe.name}: {e2}")
         return False
 
     logger.info(f"已更新到 {tag}，正在重新启动...")
@@ -540,11 +572,31 @@ class Companion:
             logger.info(f"与客户端断开连接: {reason}")
         self.lcu = None
         self.summoner = {}
+        # 断开时如果正在对局中，这局先记进待上报队列（重连后战绩生成了照样能报）；
+        # 然后必须清掉 current_game_id：以前不清，重连后下一局因为它非空而不发开局通知、不开盘
+        if self.current_game_id and self.last_phase in IN_GAME_PHASES:
+            if self.current_game_id not in self.pending_game_ids:
+                self.pending_game_ids.append(self.current_game_id)
+            self.post_game_deadline = time.time() + POST_GAME_WINDOW_SECONDS
+            self.eog_wait_until = time.time() + EOG_WAIT_SECONDS
+            logger.info(f"断开时对局 {self.current_game_id} 还在进行，重连后会补查它的战绩")
+        self.current_game_id = None
         self.last_phase = None
 
     # --- 开局通知（机器人据此开赌局）---
-    def notify_game_start(self, game_id: int) -> None:
-        """进入对局时把 gameId、模式和同队队友告诉机器人。失败只记日志，不影响其它功能。"""
+    def live_game_time(self) -> float | None:
+        """游戏内已进行的秒数（来自游戏进程的 Live Client Data 接口，端口 2999）；游戏还没起来 / 查不到返回 None"""
+        try:
+            data = _http_json("GET", "https://127.0.0.1:2999/liveclientdata/gamestats", {}, timeout=3,
+                              ssl_context=self.lcu.ctx if self.lcu else None)
+            t = (data or {}).get("gameTime")
+            return float(t) if isinstance(t, (int, float)) else None
+        except Exception:
+            return None
+
+    def notify_game_start(self, game_id: int, seen_start: bool = True) -> None:
+        """进入对局时把 gameId、模式和同队队友告诉机器人。失败只记日志，不影响其它功能。
+        seen_start：是不是亲眼看到从选人进入对局（插件中途启动接上一局正在打的对局时为 False）"""
         try:
             session = self.lcu.get("/lol-gameflow/v1/session") or {}
             game_data = session.get("gameData") or {}
@@ -594,6 +646,8 @@ class Companion:
                 "queue_id": queue.get("id") if isinstance(queue.get("id"), int) else None,
                 "teammates": teammates,
                 "players": players,
+                "game_time": self.live_game_time(),       # 已进行秒数；机器人据此决定还开不开盘
+                "phase_seen_start": bool(seen_start),
             }
             resp = self.bot.post_game_start(payload)
             for g in resp.get("blacklist_alerted") or []:
@@ -618,7 +672,7 @@ class Companion:
             return False          # 5 分钟内问过了，别反复弹
         self.last_reauth_prompt = now
         logger.error("机器人拒绝了当前令牌（401）。可能是在 Discord 重新生成过令牌。")
-        new_token = prompt("请粘贴新的令牌（在 Discord 输入 /companion_token 查看；直接回车先跳过）: ")
+        new_token = prompt_with_timeout("请粘贴新的令牌（在 Discord 输入 /companion_token 查看；直接回车或 60 秒不理会就先跳过）: ", 60)
         if not new_token:
             logger.warning("没有输入新令牌，接下来的上报会先排队，5 分钟后再问一次。")
             return False
@@ -632,8 +686,8 @@ class Companion:
     def already_sent(self, game_id: int) -> bool:
         return game_id in self.config["sent_game_ids"]
 
-    def mark_sent(self, game_id: int) -> None:
-        puuid = self.summoner.get("puuid", "")
+    def mark_sent(self, game_id: int, puuid: str | None = None) -> None:
+        puuid = puuid or self.summoner.get("puuid", "")     # 补报时可能已经换了账号登录，要记到打这局的那个账号名下
         self.config["last_game_ids"][puuid] = game_id
         sent = self.config["sent_game_ids"]
         if game_id not in sent:
@@ -642,7 +696,13 @@ class Companion:
         save_config(self.config)
 
     def collect_eog(self) -> None:
-        """结算阶段抓一次赛后统计（含治疗/护盾队友），按 gameId 缓存"""
+        """结算阶段抓一次赛后统计（含治疗/护盾队友），按 gameId 缓存。出错只记日志，不让主循环崩"""
+        try:
+            self._collect_eog()
+        except Exception as e:
+            logger.debug(f"读取赛后统计失败: {e}")
+
+    def _collect_eog(self) -> None:
         assert self.lcu is not None
         try:
             eog = self.lcu.eog_stats()
@@ -703,7 +763,7 @@ class Companion:
 
         if not self.send_latest_once:
             if (game_id == last_id or self.already_sent(game_id) or game_id == self.current_game_id
-                    or game_id in self.retry_uploads):
+                    or game_id in self.retry_uploads or game_id in self.pending_game_ids):   # 路径 1 还在等它的赛后统计
                 return
             if last_id is None:
                 # 第一次运行：以当前最新一场为基线，不重复上报旧比赛
@@ -765,8 +825,12 @@ class Companion:
             # 还没进语音频道: 30 分钟内每分钟重试一次，进了语音就会补播
             self.retry_uploads[game_id] = (payload, match_id, time.time() + RETRY_WINDOW_SECONDS)
             logger.info(f"比赛 {match_id} 暂未播报（不在语音频道），{RETRY_WINDOW_SECONDS // 60} 分钟内进语音频道会自动补报。")
-        elif outcome:
-            self.mark_sent(game_id)
+        elif outcome is False:
+            # 机器人没响应（重启 / 网络）：不在这里睡着等，进补报队列，2 小时内每分钟试一次
+            self.retry_uploads[game_id] = (payload, match_id, time.time() + FAIL_RETRY_WINDOW_SECONDS)
+            logger.warning(f"比赛 {match_id} 暂时发不出去，{FAIL_RETRY_WINDOW_SECONDS // 3600} 小时内会自动重试。")
+        else:
+            self.mark_sent(game_id, payload.get("puuid"))
 
     def process_retries(self) -> None:
         if not self.retry_uploads or time.time() < self.next_retry_check:
@@ -785,13 +849,14 @@ class Companion:
                 outcome = self.upload(payload, match_id, quiet=True)
             if outcome == "retry":
                 continue
+            if outcome is False:
+                continue          # 这次没发出去（机器人重启 / 网络）：留在队列里下次再试，到期再放弃
             self.retry_uploads.pop(game_id, None)
-            if outcome:
-                self.mark_sent(game_id)
+            self.mark_sent(game_id, payload.get("puuid"))
 
     def upload(self, payload: dict, match_id: str, quiet: bool = False):
         """返回 True=已完成, "retry"=机器人因不在语音频道跳过, False=失败"""
-        for attempt in range(1, 4):
+        for attempt in range(1, 3):
             try:
                 resp = self.bot.post_match(payload)
             except HttpError as e:
@@ -803,13 +868,19 @@ class Companion:
                 if e.status == 400:
                     logger.error(f"机器人拒绝了数据: {e.body[:300]}")
                     return True
+                if e.status == 503:
+                    # 机器人刚重启、数据库或 Riot 接口暂时不通：不是终态，进补报队列过会儿再发
+                    logger.info(f"机器人暂时判断不了这局（{e.body[:80]}），稍后自动重试。")
+                    return "retry"
                 logger.warning(f"上报失败（第 {attempt} 次）: {e}")
             except Exception as e:
                 logger.warning(f"上报失败（第 {attempt} 次）: {e}")
             else:
                 return self.report(resp, match_id, quiet)
-            time.sleep(5 * attempt)
-        logger.error(f"比赛 {match_id} 上报失败，放弃（机器人会在你下次开机时重试最新一场）。")
+            if attempt < 2:
+                time.sleep(2)     # 只快速重试一次；再不行就交给补报队列，别在这里睡几十秒不看对局
+            else:
+                break
         return False
 
     @staticmethod
@@ -841,8 +912,8 @@ class Companion:
             }.get(st, str(st))
             if not quiet or st != "not_in_voice":
                 logger.info(f"[{g.get('guild_name')}] {match_id} ({mode}/{queue}): {text}")
-        if statuses and all(s == "not_in_voice" for s in statuses):
-            return "retry"
+        if statuses and any(s == "not_in_voice" for s in statuses):
+            return "retry"        # 有一个服务器还没进语音就继续补报；已经播过的服务器会回 already_processed，无害
         return True
 
     # --- 主循环 ---
@@ -850,6 +921,7 @@ class Companion:
         interval = max(15, int(self.args.interval))
         while True:
             now = time.time()
+            self.process_retries()          # 补报不依赖客户端：打完就关客户端的人，进语音后照样能补播
             if self.lcu is None:
                 if not self.connect_lcu():
                     time.sleep(10)
@@ -866,7 +938,9 @@ class Companion:
                     self.current_game_id = self.lcu.current_game_id()
                     if self.current_game_id:
                         logger.info(f"对局进行中: gameId {self.current_game_id}")
-                        self.notify_game_start(self.current_game_id)
+                        # last_phase 是 None（插件刚起来）或本来就在对局里 = 中途接上的，不是亲眼看到开局
+                        seen_start = self.last_phase is not None and self.last_phase not in IN_GAME_PHASES
+                        self.notify_game_start(self.current_game_id, seen_start)
                 except Exception as e:
                     logger.debug(f"读取对局信息失败: {e}")
 
@@ -1165,7 +1239,9 @@ def main() -> int:
         if status is True:
             break
         if status != "unauthorized":
-            return 1
+            logger.warning("机器人暂时没响应（可能正在重启），30 秒后再试…")   # 以前直接退出，机器人重启那一分钟启动的插件就没了
+            time.sleep(30)
+            continue
         new_token = prompt("请粘贴新的令牌（在 Discord 输入 /companion_token 查看；直接回车退出）: ")
         if not new_token:
             return 1
