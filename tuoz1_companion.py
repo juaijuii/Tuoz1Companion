@@ -34,7 +34,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -555,30 +555,31 @@ class Companion:
             def entry_name(t: dict) -> str:
                 return str(t.get("gameName") or t.get("summonerName") or t.get("summonerInternalName") or "").strip()
 
-            teammates = []
-            for team in (game_data.get("teamOne") or [], game_data.get("teamTwo") or []):
+            teammates, players = [], []
+            for team_no, team in enumerate((game_data.get("teamOne") or [], game_data.get("teamTwo") or []), 1):
                 entries = [t for t in team if isinstance(t, dict)]
                 mine = any(t.get("puuid") == my_puuid or entry_name(t).lower() == my_name for t in entries)
-                if not mine:
-                    continue
                 for t in entries:
-                    if t.get("puuid") == my_puuid:
-                        continue
                     name = entry_name(t)
                     tag = str(t.get("tagLine") or "").strip()
-                    if (not name or not tag) and t.get("puuid"):
-                        # 新版客户端的对局数据里往往没有名字，按 puuid 再查一次
+                    puuid = str(t.get("puuid") or "").strip()
+                    if (not name or not tag) and puuid:
+                        # 对局数据里往往没有名字（新版客户端、或者对方开了隐藏名字），按 puuid 再查一次：
+                        # 客户端这个接口不受隐私设置影响，所以黑名单预警能抓到隐身的人
                         try:
-                            info = self.lcu.summoner_by_puuid(str(t["puuid"]))
+                            info = self.lcu.summoner_by_puuid(puuid)
                             name = str(info.get("gameName") or name or "").strip()
                             tag = str(info.get("tagLine") or tag or "").strip()
                         except Exception as e:
-                            logger.debug(f"查询队友 {t.get('puuid')} 失败: {e}")
-                    if not name or name.lower() == my_name:
-                        continue
-                    teammates.append({"game_name": name, "tag_line": tag})
-                break
+                            logger.debug(f"查询玩家 {puuid} 失败: {e}")
+                    if puuid or name:
+                        players.append({"lcu_puuid": puuid, "game_name": name, "tag_line": tag, "team": team_no,
+                                        "is_me": t.get("puuid") == my_puuid})
+                    if mine and t.get("puuid") != my_puuid and name and name.lower() != my_name:
+                        teammates.append({"game_name": name, "tag_line": tag})
             logger.info("同队队友: " + (", ".join(f"{t['game_name']}#{t['tag_line']}" for t in teammates) or "（对局数据里没有队友信息）"))
+            hidden = sum(1 for p in players if not p["game_name"])
+            logger.info(f"对局共 {len(players)} 人" + (f"，{hidden} 人查不到名字" if hidden else "") + "，已交给机器人对黑名单")
             try:
                 _, platform = self.lcu.latest_match_summary()
             except Exception:
@@ -592,8 +593,11 @@ class Companion:
                 "game_mode": queue.get("gameMode") or "",
                 "queue_id": queue.get("id") if isinstance(queue.get("id"), int) else None,
                 "teammates": teammates,
+                "players": players,
             }
             resp = self.bot.post_game_start(payload)
+            for g in resp.get("blacklist_alerted") or []:
+                logger.warning(f"⚠️ 这局里有黑名单玩家，已在 {g} 提醒")
             opened = resp.get("opened") or []
             if opened:
                 logger.info(f"已通知机器人开局，赌局在 {', '.join(opened)} 开盘（队友 {len(teammates)} 人）")
