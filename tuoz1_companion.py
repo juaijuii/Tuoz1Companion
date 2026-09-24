@@ -34,7 +34,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -648,6 +648,7 @@ class Companion:
                 "players": players,
                 "game_time": self.live_game_time(),       # 已进行秒数；机器人据此决定还开不开盘
                 "phase_seen_start": bool(seen_start),
+                "is_custom": bool(game_data.get("isCustomGame")) or str(queue.get("type") or "").upper() == "CUSTOM",
             }
             resp = self.bot.post_game_start(payload)
             for g in resp.get("blacklist_alerted") or []:
