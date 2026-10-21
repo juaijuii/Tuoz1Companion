@@ -10,7 +10,7 @@ tuoz1_companion.py — Tuoz1 Bot 客户端插件（Tuoz1 Companion）
 
 机器人地址固定为 SERVER_URL（v1.4.0 起写死在代码里，玩家不需要也不能自己填；
 旧配置文件里保存的地址会在启动时被覆盖）。首次运行只提示输入在 Discord 里用
-/companion_token 获取的令牌，配置保存在同目录的 companion_config.json。
+/插件令牌 获取的令牌，配置保存在同目录的 companion_config.json。
 
 批量导入黑名单（v1.5.0）：把 League Akari 导出的「标记玩家」JSON 拖到 exe 图标上，
 或者 `tuoz1_companion.py --import-blacklist 文件`。插件通过客户端把 puuid 换成名字，
@@ -27,6 +27,7 @@ import re
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -34,7 +35,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.5.3"
+VERSION = "1.6.0"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -276,6 +277,11 @@ class LCU:
         platform = hist.get("platformId") or ""
         return (games[0] if games else None), platform
 
+    def match_history(self, puuid: str, count: int = 20) -> list[dict]:
+        """任意玩家（puuid）最近 count 局。客户端里点开别人的战绩用的就是这个接口"""
+        data = self.get(f"/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex={count - 1}", timeout=15) or {}
+        return ((data.get("games") or {}).get("games")) or []
+
     def game_details(self, game_id: int) -> dict:
         return self.get(f"/lol-match-history/v1/games/{game_id}", timeout=30) or {}
 
@@ -323,6 +329,17 @@ def extract_eog_stats(eog: dict) -> tuple[int | None, dict[str, dict]]:
     return (game_id if isinstance(game_id, int) else None), result
 
 
+SCOUT_DETAIL_GAMES = 10       # 开局情报：每人最多补查几局详情（算伤害占比用）
+SCOUT_DETAIL_SECONDS = 8      # 补查详情最多等这么久，读条时间有限
+
+
+def _team_damage(participants: list, team_id) -> int | None:
+    """一局里某一队对英雄的总伤害；数据不全返回 None"""
+    total = sum(int((x.get("stats") or {}).get("totalDamageDealtToChampions") or 0)
+                for x in participants if x.get("teamId") == team_id)
+    return total or None
+
+
 class BotAPI:
     def __init__(self, server: str, token: str):
         self.server = server.rstrip("/")
@@ -340,6 +357,9 @@ class BotAPI:
 
     def post_game_start(self, payload: dict) -> dict:
         return _http_json("POST", self.server + "/api/companion/game_start", self.headers, body=payload, timeout=30) or {}
+
+    def post_scout(self, payload: dict) -> dict:
+        return _http_json("POST", self.server + "/api/companion/scout", self.headers, body=payload, timeout=30) or {}
 
     def post_blacklist_import(self, payload: dict) -> dict:
         # 一批最多 25 条，机器人那边每条要查一次 Riot（1.3 秒），所以超时给足
@@ -505,7 +525,7 @@ class Companion:
                 break
             except HttpError as e:
                 if e.status == 401:
-                    logger.error("机器人拒绝了这个令牌（401）。请在 Discord 用 /companion_token 查看令牌。")
+                    logger.error("机器人拒绝了这个令牌（401）。请在 Discord 用 /插件令牌 查看令牌。")
                     return "unauthorized"
                 logger.warning(f"连接机器人失败（第 {attempt} 次）: {e}")
             except Exception as e:
@@ -516,7 +536,7 @@ class Companion:
             return False
         self.bindings = info.get("bindings") or []
         if not self.bindings:
-            logger.warning("机器人上没有找到你绑定的账号，请先在 Discord 里 /bind。")
+            logger.warning("机器人上没有找到你绑定的账号，请先在 Discord 里 /绑定。")
         else:
             for b in self.bindings:
                 logger.info(f"已绑定: {b.get('game_name')} [{b.get('region')}] @ {b.get('guild_name')}")
@@ -563,7 +583,7 @@ class Companion:
             bound = (not self.bindings) or str(name).strip().lower() in bound_names
         if self.bindings and not bound:
             logger.warning(f"当前登录的账号 {name}#{tag} 没有在机器人上绑定，打完的比赛会被机器人忽略。"
-                           f"请在 Discord 用 /bind {name}#{tag} 绑定。")
+                           f"请在 Discord 用 /绑定 {name}#{tag} 绑定。")
         self.next_history_check = 0.0
         return True
 
@@ -626,7 +646,7 @@ class Companion:
                             logger.debug(f"查询玩家 {puuid} 失败: {e}")
                     if puuid or name:
                         players.append({"lcu_puuid": puuid, "game_name": name, "tag_line": tag, "team": team_no,
-                                        "is_me": t.get("puuid") == my_puuid})
+                                        "is_me": t.get("puuid") == my_puuid, "champion_id": t.get("championId")})
                     if mine and t.get("puuid") != my_puuid and name and name.lower() != my_name:
                         teammates.append({"game_name": name, "tag_line": tag})
             logger.info("同队队友: " + (", ".join(f"{t['game_name']}#{t['tag_line']}" for t in teammates) or "（对局数据里没有队友信息）"))
@@ -650,6 +670,9 @@ class Companion:
                 "phase_seen_start": bool(seen_start),
                 "is_custom": bool(game_data.get("isCustomGame")) or str(queue.get("type") or "").upper() == "CUSTOM",
             }
+            # 开局情报（v1.6.0）：查对面每个人最近的对局交给机器人。放到后台线程，不耽误开盘和主循环
+            if seen_start and not payload["is_custom"] and payload["game_mode"].upper() != "CHERRY":
+                threading.Thread(target=self.scout_enemies, args=(game_id, payload, players), daemon=True).start()
             resp = self.bot.post_game_start(payload)
             for g in resp.get("blacklist_alerted") or []:
                 logger.warning(f"⚠️ 这局里有黑名单玩家，已在 {g} 提醒")
@@ -666,6 +689,92 @@ class Companion:
         except Exception as e:
             logger.warning(f"通知机器人开局失败: {e}")
 
+    def scout_enemies(self, game_id: int, start_payload: dict, players: list[dict]) -> None:
+        """开局情报：对面每个人最近 20 局的原始数据交给机器人，谁是大哥、谁开黑由机器人算（改算法不用发新版插件）。
+        只读客户端接口，不碰 Riot API；任何失败只记日志"""
+        try:
+            my_team = next((p["team"] for p in players if p.get("is_me")), None)
+            enemies = [p for p in players if my_team and p.get("team") != my_team and p.get("lcu_puuid")][:5]
+            if not enemies:
+                logger.debug("开局情报：找不到对面的玩家，跳过")
+                return
+            lcu = self.lcu
+
+            def fetch(p: dict) -> dict:
+                rows = []
+                try:
+                    for g in lcu.match_history(p["lcu_puuid"]):
+                        if not isinstance(g, dict) or g.get("gameId") == game_id:
+                            continue
+                        parts = g.get("participants") or []
+                        idents = g.get("participantIdentities") or []
+                        # 别人的战绩列表里通常只有他自己一个人；保险起见按 puuid 找
+                        pid = next((i.get("participantId") for i in idents
+                                    if ((i.get("player") or {}).get("puuid")) == p["lcu_puuid"]), None)
+                        part = next((x for x in parts if x.get("participantId") == pid), parts[0] if parts else None)
+                        if not part:
+                            continue
+                        st = part.get("stats") or {}
+                        rows.append({
+                            "game_id": g.get("gameId"), "queue_id": g.get("queueId"),
+                            "team_id": part.get("teamId"),
+                            # 列表里如果带了全场 10 个人，直接算出他那一队的总伤害；只有他自己时先空着，后面查详情补
+                            "team_damage": _team_damage(parts, part.get("teamId")) if len(parts) >= 6 else None,
+                            "champion": self.champions.get(str(part.get("championId")), ""),
+                            "win": bool(st.get("win")), "kills": int(st.get("kills") or 0),
+                            "deaths": int(st.get("deaths") or 0), "assists": int(st.get("assists") or 0),
+                            "damage": int(st.get("totalDamageDealtToChampions") or 0),
+                            "duration": int(g.get("gameDuration") or 0),
+                        })
+                except Exception as e:
+                    logger.debug(f"开局情报：查 {p.get('game_name') or p['lcu_puuid'][:8]} 的战绩失败: {e}")
+                return {"lcu_puuid": p["lcu_puuid"], "game_name": p.get("game_name") or "", "tag_line": p.get("tag_line") or "",
+                        "champion": self.champions.get(str(p.get("champion_id")), ""), "games": rows}
+
+            from concurrent.futures import ThreadPoolExecutor, wait
+            started = time.time()
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                scouted = list(pool.map(fetch, enemies))
+            # 伤害占比要知道那一局全队打了多少：列表里没有的，按局查详情补上。每人只补最近 SCOUT_DETAIL_GAMES 局，
+            # 开黑的人共同的对局只查一次；总共最多等 SCOUT_DETAIL_SECONDS 秒，查不完的局机器人退回用每分钟伤害
+            need = {}
+            for e in scouted:
+                for row in [r for r in e["games"] if r["team_damage"] is None][:SCOUT_DETAIL_GAMES]:
+                    need.setdefault(row["game_id"], []).append(row)
+            if need:
+                def detail(gid):
+                    try:
+                        parts = (lcu.game_details(gid) or {}).get("participants") or []
+                        for row in need[gid]:
+                            row["team_damage"] = _team_damage(parts, row["team_id"])
+                    except Exception as e:
+                        logger.debug(f"开局情报：查对局 {gid} 详情失败: {e}")
+                pool = ThreadPoolExecutor(max_workers=8)
+                futures = [pool.submit(detail, gid) for gid in need]
+                done, _ = wait(futures, timeout=SCOUT_DETAIL_SECONDS)
+                pool.shutdown(wait=False, cancel_futures=True)
+                filled = sum(1 for rows in need.values() for r in rows if r["team_damage"])
+                logger.info(f"开局情报：补了 {len(done)}/{len(need)} 局详情，{filled} 条有全队伤害")
+            got = sum(1 for e in scouted if e["games"])
+            logger.info(f"开局情报：查到对面 {got}/{len(scouted)} 人的近期战绩（{time.time() - started:.1f} 秒）")
+            if not got:
+                return
+            payload = {k: start_payload.get(k) for k in ("companion_version", "game_id", "platform", "game_name",
+                                                         "tag_line", "game_mode", "queue_id", "game_time")}
+            payload["enemies"] = scouted
+            resp = self.bot.post_scout(payload)
+            if resp.get("ignored"):
+                logger.info(f"开局情报：机器人没有播（{resp['ignored']}）")
+            else:
+                logger.info("开局情报已交给机器人")
+        except HttpError as e:
+            if e.status == 404:
+                logger.debug("机器人版本还不支持开局情报")
+            else:
+                logger.warning(f"开局情报发送失败: {e}")
+        except Exception as e:
+            logger.warning(f"开局情报出错: {e}")
+
     def reauthorize(self) -> bool:
         """运行中令牌失效（比如在 Discord 重新生成了令牌）：当场让用户粘贴新令牌，不用重启"""
         now = time.time()
@@ -673,7 +782,7 @@ class Companion:
             return False          # 5 分钟内问过了，别反复弹
         self.last_reauth_prompt = now
         logger.error("机器人拒绝了当前令牌（401）。可能是在 Discord 重新生成过令牌。")
-        new_token = prompt_with_timeout("请粘贴新的令牌（在 Discord 输入 /companion_token 查看；直接回车或 60 秒不理会就先跳过）: ", 60)
+        new_token = prompt_with_timeout("请粘贴新的令牌（在 Discord 输入 /插件令牌 查看；直接回车或 60 秒不理会就先跳过）: ", 60)
         if not new_token:
             logger.warning("没有输入新令牌，接下来的上报会先排队，5 分钟后再问一次。")
             return False
