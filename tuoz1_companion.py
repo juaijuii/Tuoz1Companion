@@ -35,7 +35,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -331,6 +331,7 @@ def extract_eog_stats(eog: dict) -> tuple[int | None, dict[str, dict]]:
 
 SCOUT_DETAIL_GAMES = 10       # 开局情报：每人最多补查几局详情（算伤害占比用）
 SCOUT_DETAIL_SECONDS = 8      # 补查详情最多等这么久，读条时间有限
+SCOUT_MAX_GAME_TIME = 180     # 中途打开插件时，游戏内时间超过这么多秒就不查开局情报了
 
 
 def _team_damage(participants: list, team_id) -> int | None:
@@ -670,8 +671,12 @@ class Companion:
                 "phase_seen_start": bool(seen_start),
                 "is_custom": bool(game_data.get("isCustomGame")) or str(queue.get("type") or "").upper() == "CUSTOM",
             }
-            # 开局情报（v1.6.0）：查对面每个人最近的对局交给机器人。放到后台线程，不耽误开盘和主循环
-            if seen_start and not payload["is_custom"] and payload["game_mode"].upper() != "CHERRY":
+            # 开局情报（v1.6.0）：查对面每个人最近的对局交给机器人。放到后台线程，不耽误开盘和主循环。
+            # 读条时就开着插件的照常查；中途才打开的，游戏内时间还没到 SCOUT_MAX_GAME_TIME 也查（v1.6.1）。
+            # 中途打开又读不到游戏时间的不查：没法确认是不是已经打了很久
+            gt = payload["game_time"]
+            early = seen_start or (isinstance(gt, (int, float)) and gt <= SCOUT_MAX_GAME_TIME)
+            if early and not payload["is_custom"] and payload["game_mode"].upper() != "CHERRY":
                 threading.Thread(target=self.scout_enemies, args=(game_id, payload, players), daemon=True).start()
             resp = self.bot.post_game_start(payload)
             for g in resp.get("blacklist_alerted") or []:
