@@ -35,7 +35,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -332,6 +332,7 @@ def extract_eog_stats(eog: dict) -> tuple[int | None, dict[str, dict]]:
 SCOUT_DETAIL_GAMES = 10       # 开局情报：每人最多补查几局详情（算伤害占比用）
 SCOUT_DETAIL_SECONDS = 8      # 补查详情最多等这么久，读条时间有限
 SCOUT_MAX_GAME_TIME = 180     # 中途打开插件时，游戏内时间超过这么多秒就不查开局情报了
+ARENA_QUEUE_IDS = {1700, 1710, 1740, 1750}   # 斗魂竞技场的队列：开局情报不查（模式名字有时拿不到，靠队列和人数兜底）
 
 
 def _team_damage(participants: list, team_id) -> int | None:
@@ -676,7 +677,12 @@ class Companion:
             # 中途打开又读不到游戏时间的不查：没法确认是不是已经打了很久
             gt = payload["game_time"]
             early = seen_start or (isinstance(gt, (int, float)) and gt <= SCOUT_MAX_GAME_TIME)
-            if early and not payload["is_custom"] and payload["game_mode"].upper() != "CHERRY":
+            # 斗魂竞技场不查：读条时模式名字偶尔是空的，所以再看队列编号，以及是不是两边各 5 人
+            team_sizes = [sum(1 for p in players if p.get("team") == n) for n in (1, 2)]
+            arena = (payload["game_mode"].upper() == "CHERRY" or payload["queue_id"] in ARENA_QUEUE_IDS
+                     or team_sizes != [5, 5])
+            payload["team_sizes"] = team_sizes
+            if early and not payload["is_custom"] and not arena:
                 threading.Thread(target=self.scout_enemies, args=(game_id, payload, players), daemon=True).start()
             resp = self.bot.post_game_start(payload)
             for g in resp.get("blacklist_alerted") or []:
@@ -765,7 +771,7 @@ class Companion:
             if not got:
                 return
             payload = {k: start_payload.get(k) for k in ("companion_version", "game_id", "platform", "game_name",
-                                                         "tag_line", "game_mode", "queue_id", "game_time")}
+                                                         "tag_line", "game_mode", "queue_id", "game_time", "team_sizes")}
             payload["enemies"] = scouted
             resp = self.bot.post_scout(payload)
             if resp.get("ignored"):
