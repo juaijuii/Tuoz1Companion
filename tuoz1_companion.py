@@ -35,7 +35,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.6.2"
+VERSION = "1.6.3"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -1082,6 +1082,12 @@ class Companion:
             elif phase in EOG_PHASES and self.pending_game_ids and \
                     any(g not in self.eog_cache for g in self.pending_game_ids):
                 self.collect_eog()
+            # 已经离开结算界面（点了再来一局 / 回大厅）还没拿到赛后统计，它不会再出现了：
+            # 以前要干等满 EOG_WAIT_SECONDS 才上报，播报晚 2 分多钟
+            if self.pending_game_ids and self.eog_wait_until > now and \
+                    phase not in EOG_PHASES and phase not in IN_GAME_PHASES:
+                self.eog_wait_until = now
+                self.next_history_check = min(self.next_history_check, now)
 
             if (now >= self.next_update_check and phase not in IN_GAME_PHASES
                     and not self.pending_game_ids and not self.retry_uploads):
