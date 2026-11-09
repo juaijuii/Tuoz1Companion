@@ -40,7 +40,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -562,6 +562,7 @@ class Companion:
         self.last_lcu_warn = 0.0
         self.send_latest_once = bool(args.send_latest)
         self.last_reauth_prompt = 0.0
+        self.account_issue = ""                    # 当前登录的号有问题（没绑定 / 令牌是别人的）：窗口上红字提示
         self.current_game_id: int | None = None   # 正在打的对局
         self.pending_game_ids: list[int] = []      # 已结束、等待战绩生成的对局
         self.retry_uploads: dict[int, tuple[dict, str, float]] = {}  # 因不在语音频道被跳过的比赛: gameId -> (payload, match_id, 截止时间)
@@ -627,8 +628,10 @@ class Companion:
         logger.info(f"已连接英雄联盟客户端: {name}#{tag} (英雄数据 {len(self.champions)} 个)")
         # 让机器人用 Riot 账号接口判断当前账号是否绑定（改过名也能识别）；机器人不支持时退回按游戏名比对
         bound = None
+        elsewhere = False
         try:
             info = self.bot.ping(name, tag)
+            elsewhere = bool(info.get("current_bound_elsewhere"))     # 机器人 2026-11-09 起才有这个字段
             if "current_bound" in info:
                 bound = bool(info["current_bound"])
                 if bound and info.get("current_bound_as") and str(info["current_bound_as"]).lower() != str(name).lower():
@@ -638,9 +641,23 @@ class Companion:
         if bound is None:
             bound_names = {str(b.get("game_name") or "").strip().lower() for b in self.bindings}
             bound = (not self.bindings) or str(name).strip().lower() in bound_names
-        if self.bindings and not bound:
+        # 令牌是谁的：用它绑定的游戏号来指代（只是插件自己的绑定列表，不涉及别人的信息）
+        owner = "、".join(sorted({str(b.get("game_name") or "").strip() for b in self.bindings if b.get("game_name")})[:2])
+        self.account_issue = ""
+        if elsewhere and not bound:
+            # 共用令牌：朋友直接拷了别人的插件文件夹（里面的 companion_config.json 带着别人的令牌）
+            self.account_issue = "这个号是别人绑的，令牌不是它的"
+            logger.warning(f"当前登录的 {name}#{tag} 是另一个 Discord 账号绑定的，但插件里的令牌属于"
+                           f"{f'绑定了「{owner}」的' if owner else '另一个'} Discord 账号（令牌不能共用）。"
+                           f"这个号打的比赛和开局情报都没法通过这个插件上报。"
+                           f"请让 {name} 的主人在 Discord 输入 /插件令牌，然后删掉插件文件夹里的 companion_config.json，"
+                           f"重开插件粘贴他自己的令牌。")
+        elif self.bindings and not bound:
+            self.account_issue = "这个号没绑定"
             logger.warning(f"当前登录的账号 {name}#{tag} 没有在机器人上绑定，打完的比赛会被机器人忽略。"
-                           f"请在 Discord 用 /绑定 {name}#{tag} 绑定。")
+                           f"请在 Discord 用 /绑定 {name}#{tag} 绑定。"
+                           + (f"注意：插件里的令牌属于绑定了「{owner}」的 Discord 账号，{name} 要是别人的号，"
+                              f"得用 {name} 主人自己的 /插件令牌，令牌不能共用。" if owner else ""))
         self.next_history_check = 0.0
         return True
 
@@ -649,6 +666,7 @@ class Companion:
             logger.info(f"与客户端断开连接: {reason}")
         self.lcu = None
         self.summoner = {}
+        self.account_issue = ""
         # 断开时如果正在对局中，这局先记进待上报队列（重连后战绩生成了照样能报）；
         # 然后必须清掉 current_game_id：以前不清，重连后下一局因为它非空而不发开局通知、不开盘
         if self.current_game_id and self.last_phase in IN_GAME_PHASES:
@@ -1678,6 +1696,10 @@ class CompanionWindow:
         self.state_lbl.pack(side="left", padx=(4, 0))
         self.count_lbl = tk.Label(st, text="", bg=HEX["bg"], fg=HEX["muted"], font=(UI_FONT, 9))
         self.count_lbl.pack(side="right")
+        # 当前登录的号有问题（没绑定 / 令牌是别人的）时才出现的一行红字，详细说明在下面的日志里
+        self.issue_lbl = tk.Label(body, text="", bg=HEX["bg"], fg=HEX["bad"], font=(UI_FONT, 9), anchor="w")
+        self.issue_after = st
+        self.issue_shown = False
 
         zh = tk.Frame(body, bg=HEX["bg"], cursor="hand2")
         zh.pack(fill="x", pady=(self._p(16), 0))
@@ -1785,11 +1807,21 @@ class CompanionWindow:
             self.root.destroy()
             return
         c = self.companion
+        issue = getattr(c, "account_issue", "") if c.lcu is not None else ""
         if c.lcu is not None:
             name = c.summoner.get("gameName") or c.summoner.get("displayName") or ""
             self.state_lbl.config(text=f"已连上机器人 · 客户端 {name}".rstrip())
         else:
             self.state_lbl.config(text="已连上机器人 · 等待客户端")
+        self.dot.config(fg=HEX["bad"] if issue else HEX["ok"])
+        if issue:
+            self.issue_lbl.config(text=f"⚠ {issue}，怎么办看下面的日志")
+            if not self.issue_shown:
+                self.issue_lbl.pack(fill="x", after=self.issue_after, pady=(self._p(2), 0))
+                self.issue_shown = True
+        elif self.issue_shown:
+            self.issue_lbl.pack_forget()
+            self.issue_shown = False
         day, n = UI_STATE["uploads"]
         self.count_lbl.config(text=f"今天播报 {n if day == time.strftime('%Y-%m-%d') else 0} 局")
         if self.log_btn is not None:
