@@ -17,9 +17,9 @@ tuoz1_companion.py — Tuoz1 Bot 客户端插件（Tuoz1 Companion）
 再发给机器人存进你选的服务器的黑名单（要求你是那个服务器的管理员）。
 
 窗口（v1.7.0）：连上机器人后弹出一个小窗口（tkinter，标准库），黑色命令行窗口自动藏起来，
-点「完整日志」再显示。窗口里有「英雄联盟，启动！」按钮和「国服汉化」开关：
+点「完整日志」再显示。窗口里有「英雄联盟，启动！」按钮和「简中汉化」开关：
 汉化 = 把 Riot 的 league_of_legends.live.product_settings.yaml 里的 locale 改成 zh_CN
-（国服的文字和语音），插件开着的时候 Riot 客户端改回去就再改过来。--no-gui 只用命令行。
+（简体中文的文字和语音），插件开着的时候 Riot 客户端改回去就再改过来。--no-gui 只用命令行。
 """
 from __future__ import annotations
 
@@ -1373,7 +1373,7 @@ def run_blacklist_import(path: Path, companion: "Companion", bot: "BotAPI") -> i
 
 
 # ----------------------------------------------------------------------------
-# 国服汉化：改 Riot 的语言设置文件，文字和语音都变成国服的
+# 简中汉化：改 Riot 的语言设置文件，文字和语音都变成简体中文
 # ----------------------------------------------------------------------------
 ZH_LOCALE = "zh_CN"
 LOCALE_CHECK_SECONDS = 3
@@ -1489,7 +1489,7 @@ class LocaleKeeper:
                 back = self.config.pop("locale_before", None) or default_game_locale()
                 try:
                     if cur and write_game_locale(back):
-                        logger.info(f"已关闭国服汉化，游戏语言恢复成 {back}")
+                        logger.info(f"已关闭简中汉化，游戏语言恢复成 {back}")
                         self.changed_while_client_open = client_open
                     self.last_error = ""
                 except Exception as e:
@@ -1509,7 +1509,7 @@ class LocaleKeeper:
                 self.last_error = "没找到英雄联盟的语言设置（游戏装了吗？）"
                 return
             if write_game_locale(ZH_LOCALE):
-                logger.info(f"游戏语言 {cur} → {ZH_LOCALE}（国服文字和语音）")
+                logger.info(f"游戏语言 {cur} → {ZH_LOCALE}（简体中文文字和语音）")
                 self.changed_while_client_open = client_open
             self.last_error = ""
         except Exception as e:
@@ -1534,8 +1534,8 @@ class LocaleKeeper:
             return "没找到英雄联盟的语言设置（游戏装了吗？）"
         if self.enabled:
             if self.changed_while_client_open:
-                return "已改成国服中文，客户端重开一次后生效"
-            return "游戏语言：国服中文（第一次会提示下载语音包）" if cur == ZH_LOCALE else "正在改成国服中文…"
+                return "已改成简体中文，客户端重开一次后生效"
+            return "游戏语言：简体中文（第一次会提示下载语音包）" if cur == ZH_LOCALE else "正在改成简体中文…"
         return f"游戏语言：{cur}（未汉化）"
 
 
@@ -1665,7 +1665,7 @@ class CompanionWindow:
         self.box = tk.Label(zh, text="", width=2, bg=HEX["bg"], fg=HEX["gold"], font=(UI_FONT, 9, "bold"),
                             highlightthickness=1, highlightbackground=HEX["gold"], highlightcolor=HEX["gold"])
         self.box.pack(side="left")
-        self.zh_lbl = tk.Label(zh, text="国服汉化（文字 + 语音）", bg=HEX["bg"], fg=HEX["text"], font=(UI_FONT, 11))
+        self.zh_lbl = tk.Label(zh, text="简中汉化（文字 + 语音）", bg=HEX["bg"], fg=HEX["text"], font=(UI_FONT, 11))
         self.zh_lbl.pack(side="left", padx=(self._p(8), 0))
         for w in (zh, self.box, self.zh_lbl):
             w.bind("<Button-1>", lambda e: self.toggle_zh())
@@ -1736,7 +1736,7 @@ class CompanionWindow:
         show_console(UI_STATE["console_hidden"])
 
     def on_close(self):
-        if self.messagebox.askokcancel("退出小警察", "退出后不再上报战绩和开局情报，国服汉化也不会再自动保持。\n确定退出吗？",
+        if self.messagebox.askokcancel("退出小警察", "退出后不再上报战绩和开局情报，简中汉化也不会再自动保持。\n确定退出吗？",
                                        parent=self.root):
             self.root.destroy()
 
@@ -1884,9 +1884,9 @@ def main() -> int:
         code = run_blacklist_import(Path(import_file), companion, bot)
         pause_before_exit()      # 拖文件启动的窗口会直接关掉，得让人看到结果
         return code
-    keeper = LocaleKeeper(config)       # 国服汉化：开着就一直保持（不管是不是从窗口点的启动）
+    keeper = LocaleKeeper(config)       # 简中汉化：开着就一直保持（不管是不是从窗口点的启动）
     if keeper.enabled:
-        logger.info(f"国服汉化已开启（{keeper.status()}）")
+        logger.info(f"简中汉化已开启（{keeper.status()}）")
     try:
         if IS_WINDOWS and not args.no_gui:
             return run_with_window(companion, keeper)
