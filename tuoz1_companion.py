@@ -40,7 +40,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -1463,8 +1463,21 @@ def launch_lol() -> str:
     return "正在打开英雄联盟…"
 
 
+def league_client_running() -> bool:
+    """英雄联盟客户端（大厅）现在开着没有。看进程，不看插件连没连上：
+    插件刚启动、还没连上客户端时改了语言，也得知道「这次要重开客户端才生效」"""
+    if not IS_WINDOWS:
+        return False
+    tasklist = os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32", "tasklist.exe")
+    if not os.path.exists(tasklist):
+        return False
+    out = _run_hidden([tasklist, "/FI", "IMAGENAME eq LeagueClientUx.exe", "/NH", "/FO", "CSV"], timeout=10)
+    return "leagueclientux.exe" in out.lower()
+
+
 class LocaleKeeper:
-    """汉化开着的时候每 3 秒看一眼语言设置，Riot 客户端（更新 / 修复 / 改设置）改回去了就再改成 zh_CN"""
+    """汉化开着的时候每 3 秒看一眼语言设置，Riot 客户端（更新 / 修复 / 改设置）改回去了就再改成 zh_CN。
+    改的那一刻客户端开着的话，这次不生效、要重开客户端：窗口上一直提示，直到客户端关掉"""
 
     def __init__(self, config: dict):
         self.config = config
@@ -1477,40 +1490,41 @@ class LocaleKeeper:
     def enabled(self) -> bool:
         return bool(self.config.get("zh_locale"))
 
-    def set_enabled(self, on: bool, client_open: bool = False) -> None:
+    def set_enabled(self, on: bool) -> None:
         with self._lock:
             cur = read_game_locale()
             self.config["zh_locale"] = bool(on)
             if on:
                 if cur and cur != ZH_LOCALE and not self.config.get("locale_before"):
                     self.config["locale_before"] = cur      # 关掉汉化时还原成它
-                self._apply(client_open)
+                self._apply()
             else:
                 back = self.config.pop("locale_before", None) or default_game_locale()
                 try:
                     if cur and write_game_locale(back):
                         logger.info(f"已关闭简中汉化，游戏语言恢复成 {back}")
-                        self.changed_while_client_open = client_open
+                        self.changed_while_client_open = league_client_running()
                     self.last_error = ""
                 except Exception as e:
                     self.last_error = f"恢复语言失败：{e}"
                     logger.warning(self.last_error)
             save_config(self.config)
 
-    def ensure(self, client_open: bool = False) -> None:
+    def ensure(self) -> None:
         if self.enabled:
             with self._lock:
-                self._apply(client_open)
+                self._apply()
 
-    def _apply(self, client_open: bool) -> None:
+    def _apply(self) -> None:
         try:
             cur = read_game_locale()
             if cur is None:
                 self.last_error = "没找到英雄联盟的语言设置（游戏装了吗？）"
                 return
             if write_game_locale(ZH_LOCALE):
-                logger.info(f"游戏语言 {cur} → {ZH_LOCALE}（简体中文文字和语音）")
-                self.changed_while_client_open = client_open
+                self.changed_while_client_open = league_client_running()
+                logger.info(f"游戏语言 {cur} → {ZH_LOCALE}（简体中文文字和语音）"
+                            + ("，客户端开着，重开一次客户端后生效" if self.changed_while_client_open else ""))
             self.last_error = ""
         except Exception as e:
             msg = f"改语言失败：{e}"
@@ -1522,6 +1536,9 @@ class LocaleKeeper:
         while True:
             try:
                 self.ensure()
+                # 客户端关掉了：下次打开读的就是新语言，「要重开」的提示可以撤了
+                if self.changed_while_client_open and not league_client_running():
+                    self.changed_while_client_open = False
             except Exception:
                 pass
             time.sleep(LOCALE_CHECK_SECONDS)
@@ -1536,6 +1553,8 @@ class LocaleKeeper:
             if self.changed_while_client_open:
                 return "已改成简体中文，客户端重开一次后生效"
             return "游戏语言：简体中文（第一次会提示下载语音包）" if cur == ZH_LOCALE else "正在改成简体中文…"
+        if self.changed_while_client_open:
+            return f"已恢复成 {cur}，客户端重开一次后生效"
         return f"游戏语言：{cur}（未汉化）"
 
 
@@ -1713,7 +1732,7 @@ class CompanionWindow:
 
         def work():
             try:
-                self.keeper.ensure(self.companion.lcu is not None)
+                self.keeper.ensure()
                 msg = launch_lol()
             except Exception as e:
                 msg = f"启动失败：{e}"
@@ -1722,9 +1741,11 @@ class CompanionWindow:
         threading.Thread(target=work, daemon=True).start()
 
     def toggle_zh(self):
+        """勾选框马上变，改文件和查客户端进程放后台（查进程要一两百毫秒，别让窗口卡一下）"""
         on = not self.keeper.enabled
-        self.keeper.set_enabled(on, self.companion.lcu is not None)
-        self._refresh_zh()
+        self.box.config(text="✓" if on else "")
+        self.hint_override = ("正在改成简体中文…" if on else "正在恢复原来的语言…", time.time() + 1)
+        threading.Thread(target=self.keeper.set_enabled, args=(on,), daemon=True).start()
 
     def _refresh_zh(self):
         self.box.config(text="✓" if self.keeper.enabled else "")
