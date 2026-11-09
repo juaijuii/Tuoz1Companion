@@ -40,7 +40,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.7.3"
+VERSION = "1.7.4"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -305,6 +305,9 @@ class LCU:
 
     def get(self, path: str, timeout: float = 15):
         return _http_json("GET", self.base + path, self.headers, timeout=timeout, ssl_context=self.ctx)
+
+    def post(self, path: str, timeout: float = 15):
+        return _http_json("POST", self.base + path, self.headers, timeout=timeout, ssl_context=self.ctx)
 
     # --- 常用接口 ---
     def gameflow_phase(self) -> str:
@@ -1611,6 +1614,7 @@ class CompanionWindow:
         self.tk, self.messagebox = tk, messagebox
         self.companion, self.keeper, self.worker, self.log_q = companion, keeper, worker, log_q
         self.launch_until = 0.0
+        self.btn_mode = "launch"          # launch：没开客户端 / show：大厅开着，点了切过去 / ingame：对局中，点了没反应
         self.hint_override = ("", 0.0)
         try:
             import ctypes
@@ -1739,14 +1743,24 @@ class CompanionWindow:
 
         tk.Frame(body, bg=HEX["line"], height=1).pack(fill="x", pady=(self._p(16), self._p(8)))
         self.log = tk.Text(body, bg=HEX["bg"], fg=HEX["log"], font=(UI_FONT, 9), relief="flat", borderwidth=0,
-                           highlightthickness=0, wrap="word", height=8, cursor="arrow", state="disabled",
+                           highlightthickness=0, wrap="char", height=8, cursor="arrow", state="disabled",
                            selectbackground=HEX["line"], spacing1=self._p(2))
         self.log.pack(fill="both", expand=True)
+        try:
+            from tkinter import font as tkfont
+            indent = tkfont.Font(font=(UI_FONT, 9)).measure("00:00  ")
+        except Exception:
+            indent = 0
+        self.log.tag_configure("ln", lmargin2=indent)
         self._refresh_zh()
 
     # --- 交互 ---
     def _btn_look(self, kind):
         if time.time() < self.launch_until:
+            return
+        if self.btn_mode == "ingame":                       # 对局中：按钮压暗，鼠标移上去也不亮
+            self.btn.config(bg=HEX["btn"])
+            self.btn_frame.config(bg=HEX["line"])
             return
         bg = {"hover": HEX["btn_hover"], "down": HEX["btn_down"]}.get(kind, HEX["btn"])
         self.btn.config(bg=bg)
@@ -1757,7 +1771,27 @@ class CompanionWindow:
             0 <= e.y_root - self.btn_frame.winfo_rooty() <= self.btn_frame.winfo_height()
         self._btn_look("hover" if inside else "normal")
         if inside and time.time() >= self.launch_until:
-            self.start_game()
+            if self.btn_mode == "show":
+                self.show_client()
+            elif self.btn_mode == "ingame":
+                self.hint_override = ("正在对局中，打完再切回大厅", time.time() + 4)
+            else:
+                self.start_game()
+
+    def show_client(self):
+        """客户端已经开着：让它自己把大厅窗口调到前面（最小化了也会还原），不再重复启动"""
+        lcu = self.companion.lcu
+
+        def work():
+            try:
+                lcu.post("/riotclient/ux-show", timeout=5)
+                msg = "已切到游戏大厅"
+            except Exception as e:
+                msg = "没切过去，请在任务栏点英雄联盟"
+                logger.info(f"切到游戏大厅失败: {e}")
+            self.hint_override = (msg, time.time() + 4)
+        if lcu is not None:
+            threading.Thread(target=work, daemon=True).start()
 
     def start_game(self):
         self.launch_until = time.time() + 8
@@ -1806,7 +1840,7 @@ class CompanionWindow:
         if lines:
             self.log.config(state="normal")
             for ln in lines:
-                self.log.insert("end", ln + "\n")
+                self.log.insert("end", ln + "\n", "ln")
             over = int(self.log.index("end-1c").split(".")[0]) - LOG_LINES
             if over > 0:
                 self.log.delete("1.0", f"{over + 1}.0")
@@ -1840,8 +1874,21 @@ class CompanionWindow:
             self.log_btn.config(text="收起日志" if not UI_STATE["console_hidden"] else "完整日志")
         if self.launch_until and time.time() >= self.launch_until:
             self.launch_until = 0.0
-            self.btn.config(text="英雄联盟，启动！", fg=HEX["gold_hi"])
-            self._btn_look("normal")
+            self.btn_mode = ""                  # 下面按当前状态重新设置按钮
+        if not self.launch_until:
+            if c.lcu is None:
+                mode = "launch"
+            elif c.last_phase in IN_GAME_PHASES:
+                mode = "ingame"
+            else:
+                mode = "show"
+            if mode != self.btn_mode:
+                self.btn_mode = mode
+                text = {"launch": "英雄联盟，启动！", "show": "切到游戏大厅", "ingame": "对局中"}[mode]
+                self.btn.config(text=text, fg=HEX["muted"] if mode == "ingame" else HEX["gold_hi"],
+                                cursor="arrow" if mode == "ingame" else "hand2")
+                self.btn_frame.config(cursor="arrow" if mode == "ingame" else "hand2")
+                self._btn_look("normal")
         self._refresh_zh()
         self.root.after(1000, self._tick_state)
 
