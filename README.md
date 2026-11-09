@@ -25,12 +25,26 @@ python tuoz1_companion.py
 
 需要 Python 3.10 或更新版本。
 
+## 窗口、英雄联盟启动和国服汉化（v1.7.0）
+
+连上机器人以后会打开一个小窗口，黑色命令行窗口自动藏起来（点窗口右上角「完整日志」再显示，再点收起）。关掉小窗口就是退出插件。
+
+- **英雄联盟，启动！**：直接打开英雄联盟，不用再去点 Riot 客户端。
+- **国服汉化（文字 + 语音）**：勾上以后，游戏的文字和语音换成国服的。原理是把 Riot 的语言设置
+  `C:\ProgramData\Riot Games\Metadata\league_of_legends.live\league_of_legends.live.product_settings.yaml`
+  里的 `locale` 改成 `zh_CN`（第一次改之前在同目录备份一份 `.tuoz1.bak`）；插件开着的时候 Riot 客户端改回去会再改过来。
+  第一次用 Riot 客户端会提示下载语音包，点更新就行。取消勾选会恢复成原来的语言。
+  客户端开着的时候改，要重开一次客户端才生效。
+
+不想要窗口，加 `--no-gui` 只用命令行。
+
 ## 常用参数
 
 ```bash
 python tuoz1_companion.py --send-latest    # 启动后立刻把最近一场比赛上报一次（测试用）
 python tuoz1_companion.py --reset          # 重新输入令牌
 python tuoz1_companion.py --dump-dir dump  # 把上报的数据另存一份（排查问题用）
+python tuoz1_companion.py --no-gui         # 不开窗口，只用命令行
 python tuoz1_companion.py -v               # 详细日志
 ```
 

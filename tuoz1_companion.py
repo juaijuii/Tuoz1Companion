@@ -15,6 +15,11 @@ tuoz1_companion.py — Tuoz1 Bot 客户端插件（Tuoz1 Companion）
 批量导入黑名单（v1.5.0）：把 League Akari 导出的「标记玩家」JSON 拖到 exe 图标上，
 或者 `tuoz1_companion.py --import-blacklist 文件`。插件通过客户端把 puuid 换成名字，
 再发给机器人存进你选的服务器的黑名单（要求你是那个服务器的管理员）。
+
+窗口（v1.7.0）：连上机器人后弹出一个小窗口（tkinter，标准库），黑色命令行窗口自动藏起来，
+点「完整日志」再显示。窗口里有「英雄联盟，启动！」按钮和「国服汉化」开关：
+汉化 = 把 Riot 的 league_of_legends.live.product_settings.yaml 里的 locale 改成 zh_CN
+（国服的文字和语音），插件开着的时候 Riot 客户端改回去就再改过来。--no-gui 只用命令行。
 """
 from __future__ import annotations
 
@@ -35,7 +40,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.6.3"
+VERSION = "1.7.0"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -86,6 +91,7 @@ def save_config(config: dict) -> None:
 
 
 def prompt(text: str) -> str:
+    show_console(True)
     try:
         return input(text).strip()
     except EOFError:
@@ -96,6 +102,7 @@ def prompt_with_timeout(text: str, seconds: float) -> str:
     """最多等 seconds 秒的输入：后台没人看控制台时不能让主循环（看对局、补报）卡在 input() 上"""
     import threading
     box = {}
+    show_console(True)        # 窗口模式下黑框是藏起来的，要输入就得先让人看见
 
     def _read():
         try:
@@ -106,6 +113,54 @@ def prompt_with_timeout(text: str, seconds: float) -> str:
     t.start()
     t.join(seconds)
     return box.get("v", "")
+
+
+# 窗口模式下黑色命令行窗口默认藏起来；要输入令牌、或者点了「完整日志」时再显示
+UI_STATE = {"console_hidden": False, "uploads": (None, 0)}
+
+
+def _console_hwnd() -> int:
+    if not IS_WINDOWS:
+        return 0
+    try:
+        import ctypes
+        return int(ctypes.windll.kernel32.GetConsoleWindow() or 0)
+    except Exception:
+        return 0
+
+
+def console_is_ours() -> bool:
+    """黑框是不是插件自己的（双击 exe 打开的）。从 cmd / 终端里运行时黑框是别人的，不能藏。
+    PyInstaller 单文件版有两个进程（启动器 + 本体）挂在同一个黑框上，所以不超过 2 个都算自己的"""
+    if not (IS_WINDOWS and IS_FROZEN and _console_hwnd()):
+        return False
+    try:
+        import ctypes
+        arr = (ctypes.c_uint32 * 8)()
+        return ctypes.windll.kernel32.GetConsoleProcessList(arr, 8) <= 2
+    except Exception:
+        return False
+
+
+def show_console(show: bool) -> None:
+    hwnd = _console_hwnd()
+    if not hwnd or (not show and not console_is_ours()):
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.ShowWindow(hwnd, 5 if show else 0)      # SW_SHOW / SW_HIDE
+        if show:
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+        UI_STATE["console_hidden"] = not show
+    except Exception:
+        pass
+
+
+def count_broadcast() -> None:
+    """窗口上的「今天播报 N 局」"""
+    today = time.strftime("%Y-%m-%d")
+    day, n = UI_STATE["uploads"]
+    UI_STATE["uploads"] = (today, (n if day == today else 0) + 1)
 
 
 def pause_before_exit() -> None:
@@ -1033,6 +1088,8 @@ class Companion:
             }.get(st, str(st))
             if not quiet or st != "not_in_voice":
                 logger.info(f"[{g.get('guild_name')}] {match_id} ({mode}/{queue}): {text}")
+        if any(s in ("accepted", "broadcast") for s in statuses):
+            count_broadcast()
         if statuses and any(s == "not_in_voice" for s in statuses):
             return "retry"        # 有一个服务器还没进语音就继续补报；已经播过的服务器会回 already_processed，无害
         return True
@@ -1315,6 +1372,452 @@ def run_blacklist_import(path: Path, companion: "Companion", bot: "BotAPI") -> i
     return 0
 
 
+# ----------------------------------------------------------------------------
+# 国服汉化：改 Riot 的语言设置文件，文字和语音都变成国服的
+# ----------------------------------------------------------------------------
+ZH_LOCALE = "zh_CN"
+LOCALE_CHECK_SECONDS = 3
+_LOCALE_RE = re.compile(r'^(settings:[ \t]*\r?\n(?:[ \t]+.*\r?\n)*?[ \t]+locale:[ \t]*)"?([A-Za-z_]*)"?', re.M)
+_DEFAULT_LOCALE_RE = re.compile(r'^[ \t]+default_locale:[ \t]*"?([A-Za-z_]+)"?', re.M)
+
+
+def lol_settings_path() -> Path:
+    base = os.environ.get("PROGRAMDATA") or r"C:\ProgramData"
+    return (Path(base) / "Riot Games" / "Metadata" / "league_of_legends.live"
+            / "league_of_legends.live.product_settings.yaml")
+
+
+def read_game_locale(path: Path | None = None) -> str | None:
+    """现在游戏用的语言（zh_CN / en_AU …）；没装游戏或读不出来是 None"""
+    try:
+        m = _LOCALE_RE.search((path or lol_settings_path()).read_bytes().decode("utf-8"))
+        return m.group(2) if m else None
+    except Exception:
+        return None
+
+
+def default_game_locale(path: Path | None = None) -> str:
+    """这个区服本来的语言（关掉汉化时退回它）"""
+    try:
+        m = _DEFAULT_LOCALE_RE.search((path or lol_settings_path()).read_bytes().decode("utf-8"))
+        return m.group(1) if m else "en_US"
+    except Exception:
+        return "en_US"
+
+
+def write_game_locale(locale: str, path: Path | None = None) -> bool:
+    """把 settings 下面的 locale 改成 locale。只改这一行，其余原样保留；第一次改之前备份一份"""
+    path = path or lol_settings_path()
+    raw = path.read_bytes().decode("utf-8")
+    new, n = _LOCALE_RE.subn(lambda m: f'{m.group(1)}"{locale}"', raw, count=1)
+    if not n:
+        raise RuntimeError("语言设置文件里没找到 settings.locale")
+    if new == raw:
+        return False
+    backup = path.with_name(path.name + ".tuoz1.bak")
+    if not backup.exists():
+        backup.write_bytes(raw.encode("utf-8"))
+    try:
+        os.chmod(path, 0o666)        # 有的工具会把它设成只读
+    except Exception:
+        pass
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(new.encode("utf-8"))
+    os.replace(tmp, path)
+    return True
+
+
+def find_riot_client() -> Path | None:
+    """RiotClientServices.exe 在哪：先看 Riot 自己记的安装信息，再看游戏装在哪"""
+    base = Path(os.environ.get("PROGRAMDATA") or r"C:\ProgramData") / "Riot Games"
+    try:
+        info = json.loads((base / "RiotClientInstalls.json").read_text(encoding="utf-8"))
+        for key in ("rc_default", "rc_live"):
+            if info.get(key) and Path(info[key]).is_file():
+                return Path(info[key])
+        for p in (info.get("associated_client") or {}).values():
+            if p and Path(p).is_file():
+                return Path(p)
+    except Exception:
+        pass
+    try:
+        m = re.search(r'^product_install_root:[ \t]*"?([^"\r\n]+)"?', lol_settings_path().read_text(encoding="utf-8"), re.M)
+        if m:
+            p = Path(m.group(1)) / "Riot Client" / "RiotClientServices.exe"
+            if p.is_file():
+                return p
+    except Exception:
+        pass
+    return None
+
+
+def launch_lol() -> str:
+    """拉起英雄联盟（和桌面快捷方式一样的参数）。返回给窗口看的一句话"""
+    exe = find_riot_client()
+    if exe is None:
+        return "没找到 Riot 客户端，请用平时的方式打开游戏"
+    flags = 0x00000008 | 0x00000200 if IS_WINDOWS else 0       # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen([str(exe), "--launch-product=league_of_legends", "--launch-patchline=live"],
+                     close_fds=True, creationflags=flags)
+    logger.info(f"英雄联盟，启动！（{exe}）")
+    return "正在打开英雄联盟…"
+
+
+class LocaleKeeper:
+    """汉化开着的时候每 3 秒看一眼语言设置，Riot 客户端（更新 / 修复 / 改设置）改回去了就再改成 zh_CN"""
+
+    def __init__(self, config: dict):
+        self.config = config
+        self.changed_while_client_open = False
+        self.last_error = ""
+        self._lock = threading.Lock()
+        threading.Thread(target=self._loop, daemon=True, name="locale").start()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.config.get("zh_locale"))
+
+    def set_enabled(self, on: bool, client_open: bool = False) -> None:
+        with self._lock:
+            cur = read_game_locale()
+            self.config["zh_locale"] = bool(on)
+            if on:
+                if cur and cur != ZH_LOCALE and not self.config.get("locale_before"):
+                    self.config["locale_before"] = cur      # 关掉汉化时还原成它
+                self._apply(client_open)
+            else:
+                back = self.config.pop("locale_before", None) or default_game_locale()
+                try:
+                    if cur and write_game_locale(back):
+                        logger.info(f"已关闭国服汉化，游戏语言恢复成 {back}")
+                        self.changed_while_client_open = client_open
+                    self.last_error = ""
+                except Exception as e:
+                    self.last_error = f"恢复语言失败：{e}"
+                    logger.warning(self.last_error)
+            save_config(self.config)
+
+    def ensure(self, client_open: bool = False) -> None:
+        if self.enabled:
+            with self._lock:
+                self._apply(client_open)
+
+    def _apply(self, client_open: bool) -> None:
+        try:
+            cur = read_game_locale()
+            if cur is None:
+                self.last_error = "没找到英雄联盟的语言设置（游戏装了吗？）"
+                return
+            if write_game_locale(ZH_LOCALE):
+                logger.info(f"游戏语言 {cur} → {ZH_LOCALE}（国服文字和语音）")
+                self.changed_while_client_open = client_open
+            self.last_error = ""
+        except Exception as e:
+            msg = f"改语言失败：{e}"
+            if msg != self.last_error:
+                logger.warning(msg)
+            self.last_error = msg
+
+    def _loop(self) -> None:
+        while True:
+            try:
+                self.ensure()
+            except Exception:
+                pass
+            time.sleep(LOCALE_CHECK_SECONDS)
+
+    def status(self) -> str:
+        if self.last_error:
+            return self.last_error
+        cur = read_game_locale()
+        if cur is None:
+            return "没找到英雄联盟的语言设置（游戏装了吗？）"
+        if self.enabled:
+            if self.changed_while_client_open:
+                return "已改成国服中文，客户端重开一次后生效"
+            return "游戏语言：国服中文（第一次会提示下载语音包）" if cur == ZH_LOCALE else "正在改成国服中文…"
+        return f"游戏语言：{cur}（未汉化）"
+
+
+# ----------------------------------------------------------------------------
+# 窗口：海克斯金色主题。插件本身照常在后台线程里跑，窗口只负责显示和启动游戏
+# ----------------------------------------------------------------------------
+HEX = {"bg": "#0A1428", "title": "#010A13", "gold": "#C8AA6E", "gold_hi": "#F0E6D2", "text": "#F0E6D2",
+       "muted": "#A09B8C", "btn": "#1E2328", "btn_hover": "#1E282D", "btn_down": "#111820", "line": "#3C3C41",
+       "ok": "#0AC8B9", "bad": "#E84057", "log": "#8C8B85"}
+UI_FONT = "Microsoft YaHei UI"
+LOG_LINES = 300
+
+
+class _UiLogHandler(logging.Handler):
+    def __init__(self, q):
+        super().__init__(logging.INFO)
+        self.q = q
+        self.setFormatter(logging.Formatter("%(asctime)s  %(message)s", "%H:%M"))
+
+    def emit(self, record):
+        try:
+            self.q.put(self.format(record))
+        except Exception:
+            pass
+
+
+class CompanionWindow:
+    def __init__(self, companion, keeper: LocaleKeeper, worker: threading.Thread, log_q):
+        import tkinter as tk
+        from tkinter import messagebox
+        self.tk, self.messagebox = tk, messagebox
+        self.companion, self.keeper, self.worker, self.log_q = companion, keeper, worker, log_q
+        self.launch_until = 0.0
+        self.hint_override = ("", 0.0)
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)     # 高分屏上字不发虚
+        except Exception:
+            pass
+        self.root = root = tk.Tk()
+        self.px = max(1.0, root.winfo_fpixels("1i") / 96)
+        root.title(f"托子的小警察 v{VERSION}")
+        root.configure(bg=HEX["bg"])
+        root.minsize(int(380 * self.px), int(400 * self.px))
+        root.geometry(f"{int(400 * self.px)}x{int(410 * self.px)}")
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._dark_title_bar()
+        self._set_icon()
+        self._build()
+        root.after(100, self._tick_logs)
+        root.after(300, self._tick_state)
+
+    def _dark_title_bar(self):
+        """Windows 10/11 的标题栏改成深色，和窗口一个颜色系"""
+        try:
+            import ctypes
+            self.root.update()
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            on = ctypes.c_int(1)
+            for attr in (20, 19):           # DWMWA_USE_IMMERSIVE_DARK_MODE（新 / 旧版本号）
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(on), ctypes.sizeof(on)) == 0:
+                    break
+        except Exception:
+            pass
+
+    def _set_icon(self):
+        """标题栏 / 任务栏图标：深蓝底上一个金色六边形（换掉 Tk 默认的羽毛）"""
+        try:
+            n = 32
+            img = self.tk.PhotoImage(width=n, height=n)
+            c, R, w = (n - 1) / 2, 15.0, 2.6
+            rows = []
+            for y in range(n):
+                row = []
+                for x in range(n):
+                    dx, dy = abs(x - c), abs(y - c)
+                    d = max(dx * 0.866 + dy * 0.5, dy)       # 尖朝上的正六边形「半径」
+                    if d <= R - w:
+                        row.append(HEX["title"] if d > R - w - 2.2 else HEX["bg"])
+                    elif d <= R:
+                        row.append(HEX["gold"])
+                    else:
+                        row.append(HEX["bg"])
+                rows.append("{" + " ".join(row) + "}")
+            img.put(" ".join(rows))
+            for y in range(n):                                # 中间一颗金色的点
+                for x in range(n):
+                    if (x - c) ** 2 + (y - c) ** 2 <= 20:
+                        img.put(HEX["gold_hi"], (x, y))
+            self._icon = img
+            self.root.iconphoto(True, img)
+        except Exception:
+            pass
+
+    def _p(self, n):
+        return int(n * self.px)
+
+    def _build(self):
+        tk = self.tk
+        root, pad = self.root, self._p(18)
+        body = tk.Frame(root, bg=HEX["bg"])
+        body.pack(fill="both", expand=True, padx=pad, pady=(self._p(14), pad))
+
+        head = tk.Frame(body, bg=HEX["bg"])
+        head.pack(fill="x")
+        tk.Label(head, text="托子的小警察", bg=HEX["bg"], fg=HEX["gold"], font=(UI_FONT, 13, "bold")).pack(side="left")
+        tk.Label(head, text=f"v{VERSION}", bg=HEX["bg"], fg=HEX["muted"], font=(UI_FONT, 9)).pack(side="left", padx=(6, 0), pady=(4, 0))
+        self.log_btn = None
+        if console_is_ours():
+            self.log_btn = tk.Label(head, text="完整日志", bg=HEX["bg"], fg=HEX["muted"], font=(UI_FONT, 9), cursor="hand2")
+            self.log_btn.pack(side="right", pady=(4, 0))
+            self.log_btn.bind("<Button-1>", lambda e: self.toggle_console())
+            self.log_btn.bind("<Enter>", lambda e: self.log_btn.config(fg=HEX["gold"]))
+            self.log_btn.bind("<Leave>", lambda e: self.log_btn.config(fg=HEX["muted"]))
+
+        st = tk.Frame(body, bg=HEX["bg"])
+        st.pack(fill="x", pady=(self._p(10), 0))
+        self.dot = tk.Label(st, text="●", bg=HEX["bg"], fg=HEX["ok"], font=(UI_FONT, 9))
+        self.dot.pack(side="left")
+        self.state_lbl = tk.Label(st, text="已连上机器人", bg=HEX["bg"], fg=HEX["muted"], font=(UI_FONT, 9))
+        self.state_lbl.pack(side="left", padx=(4, 0))
+        self.count_lbl = tk.Label(st, text="", bg=HEX["bg"], fg=HEX["muted"], font=(UI_FONT, 9))
+        self.count_lbl.pack(side="right")
+
+        zh = tk.Frame(body, bg=HEX["bg"], cursor="hand2")
+        zh.pack(fill="x", pady=(self._p(16), 0))
+        self.box = tk.Label(zh, text="", width=2, bg=HEX["bg"], fg=HEX["gold"], font=(UI_FONT, 9, "bold"),
+                            highlightthickness=1, highlightbackground=HEX["gold"], highlightcolor=HEX["gold"])
+        self.box.pack(side="left")
+        self.zh_lbl = tk.Label(zh, text="国服汉化（文字 + 语音）", bg=HEX["bg"], fg=HEX["text"], font=(UI_FONT, 11))
+        self.zh_lbl.pack(side="left", padx=(self._p(8), 0))
+        for w in (zh, self.box, self.zh_lbl):
+            w.bind("<Button-1>", lambda e: self.toggle_zh())
+        self.hint = tk.Label(body, text="", bg=HEX["bg"], fg=HEX["muted"], font=(UI_FONT, 9), anchor="w", justify="left")
+        self.hint.pack(fill="x", pady=(self._p(4), 0))
+
+        # 大按钮：金色描边。鼠标移上去描边变亮、底色提一点；按下去底色压暗；点完 8 秒内显示「启动中…」
+        self.btn_frame = tk.Frame(body, bg=HEX["gold"], cursor="hand2")
+        self.btn_frame.pack(fill="x", pady=(self._p(16), 0))
+        self.btn = tk.Label(self.btn_frame, text="英雄联盟，启动！", bg=HEX["btn"], fg=HEX["gold_hi"],
+                            font=(UI_FONT, 15, "bold"), pady=self._p(12), cursor="hand2")
+        self.btn.pack(fill="both", padx=2, pady=2)
+        for w in (self.btn_frame, self.btn):
+            w.bind("<Enter>", lambda e: self._btn_look("hover"))
+            w.bind("<Leave>", lambda e: self._btn_look("normal"))
+            w.bind("<ButtonPress-1>", lambda e: self._btn_look("down"))
+            w.bind("<ButtonRelease-1>", self._btn_release)
+
+        tk.Frame(body, bg=HEX["line"], height=1).pack(fill="x", pady=(self._p(16), self._p(8)))
+        self.log = tk.Text(body, bg=HEX["bg"], fg=HEX["log"], font=(UI_FONT, 9), relief="flat", borderwidth=0,
+                           highlightthickness=0, wrap="word", height=8, cursor="arrow", state="disabled",
+                           selectbackground=HEX["line"], spacing1=self._p(2))
+        self.log.pack(fill="both", expand=True)
+        self._refresh_zh()
+
+    # --- 交互 ---
+    def _btn_look(self, kind):
+        if time.time() < self.launch_until:
+            return
+        bg = {"hover": HEX["btn_hover"], "down": HEX["btn_down"]}.get(kind, HEX["btn"])
+        self.btn.config(bg=bg)
+        self.btn_frame.config(bg=HEX["gold_hi"] if kind in ("hover", "down") else HEX["gold"])
+
+    def _btn_release(self, e):
+        inside = 0 <= e.x_root - self.btn_frame.winfo_rootx() <= self.btn_frame.winfo_width() and \
+            0 <= e.y_root - self.btn_frame.winfo_rooty() <= self.btn_frame.winfo_height()
+        self._btn_look("hover" if inside else "normal")
+        if inside and time.time() >= self.launch_until:
+            self.start_game()
+
+    def start_game(self):
+        self.launch_until = time.time() + 8
+        self.btn.config(text="启动中…", bg=HEX["btn_down"], fg=HEX["muted"])
+        self.btn_frame.config(bg=HEX["line"])
+
+        def work():
+            try:
+                self.keeper.ensure(self.companion.lcu is not None)
+                msg = launch_lol()
+            except Exception as e:
+                msg = f"启动失败：{e}"
+                logger.warning(msg)
+            self.hint_override = (msg, time.time() + 6)
+        threading.Thread(target=work, daemon=True).start()
+
+    def toggle_zh(self):
+        on = not self.keeper.enabled
+        self.keeper.set_enabled(on, self.companion.lcu is not None)
+        self._refresh_zh()
+
+    def _refresh_zh(self):
+        self.box.config(text="✓" if self.keeper.enabled else "")
+        msg, until = self.hint_override
+        self.hint.config(text=msg if time.time() < until else self.keeper.status(),
+                         fg=HEX["bad"] if self.keeper.last_error else HEX["muted"])
+
+    def toggle_console(self):
+        show_console(UI_STATE["console_hidden"])
+
+    def on_close(self):
+        if self.messagebox.askokcancel("退出小警察", "退出后不再上报战绩和开局情报，国服汉化也不会再自动保持。\n确定退出吗？",
+                                       parent=self.root):
+            self.root.destroy()
+
+    # --- 定时刷新 ---
+    def _tick_logs(self):
+        lines = []
+        try:
+            while True:
+                lines.append(self.log_q.get_nowait())
+        except Exception:
+            pass
+        if lines:
+            self.log.config(state="normal")
+            for ln in lines:
+                self.log.insert("end", ln + "\n")
+            over = int(self.log.index("end-1c").split(".")[0]) - LOG_LINES
+            if over > 0:
+                self.log.delete("1.0", f"{over + 1}.0")
+            self.log.see("end")
+            self.log.config(state="disabled")
+        self.root.after(200, self._tick_logs)
+
+    def _tick_state(self):
+        if not self.worker.is_alive():          # 主循环退出（比如自动更新换了新版本）：窗口跟着关
+            self.root.destroy()
+            return
+        c = self.companion
+        if c.lcu is not None:
+            name = c.summoner.get("gameName") or c.summoner.get("displayName") or ""
+            self.state_lbl.config(text=f"已连上机器人 · 客户端 {name}".rstrip())
+        else:
+            self.state_lbl.config(text="已连上机器人 · 等待客户端")
+        day, n = UI_STATE["uploads"]
+        self.count_lbl.config(text=f"今天播报 {n if day == time.strftime('%Y-%m-%d') else 0} 局")
+        if self.log_btn is not None:
+            self.log_btn.config(text="收起日志" if not UI_STATE["console_hidden"] else "完整日志")
+        if self.launch_until and time.time() >= self.launch_until:
+            self.launch_until = 0.0
+            self.btn.config(text="英雄联盟，启动！", fg=HEX["gold_hi"])
+            self._btn_look("normal")
+        self._refresh_zh()
+        self.root.after(1000, self._tick_state)
+
+    def run(self):
+        self.root.mainloop()
+
+
+def run_with_window(companion, keeper: LocaleKeeper) -> int:
+    """插件主循环放后台线程，窗口在主线程。窗口起不来就退回纯命令行"""
+    import queue
+    try:
+        import tkinter  # noqa: F401
+    except Exception as e:
+        logger.info(f"窗口模块不可用（{e}），只用命令行。")
+        companion.run()
+        return 0
+    log_q = queue.Queue()
+    handler = _UiLogHandler(log_q)
+    logging.getLogger().addHandler(handler)
+
+    def work():
+        try:
+            companion.run()
+        except Exception as e:
+            logger.error(f"插件主循环出错: {e}", exc_info=True)
+    worker = threading.Thread(target=work, daemon=True, name="companion")
+    try:
+        win = CompanionWindow(companion, keeper, worker, log_q)
+    except Exception as e:
+        logging.getLogger().removeHandler(handler)
+        logger.warning(f"窗口打不开（{e}），只用命令行。")
+        companion.run()
+        return 0
+    worker.start()
+    logger.info("窗口已打开。黑色命令行窗口已隐藏，点窗口右上角「完整日志」可以再显示。" if console_is_ours()
+                else "窗口已打开。")
+    show_console(False)
+    win.run()
+    return 0
+
+
 def main() -> int:
     setup_console_utf8()
     parser = argparse.ArgumentParser(description=f"{APP_NAME} — Tuoz1 Bot 客户端插件")
@@ -1327,6 +1830,7 @@ def main() -> int:
     parser.add_argument("--no-update", action="store_true", help="不自动检查/安装新版本")
     parser.add_argument("--import-blacklist", metavar="文件", help="批量导入黑名单：League Akari 的标记玩家导出，或带 riot_id 的 JSON 列表")
     parser.add_argument("file", nargs="?", help=argparse.SUPPRESS)   # 把文件拖到 exe 上时，路径就在这里
+    parser.add_argument("--no-gui", action="store_true", help="不开窗口，只用命令行")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -1380,7 +1884,12 @@ def main() -> int:
         code = run_blacklist_import(Path(import_file), companion, bot)
         pause_before_exit()      # 拖文件启动的窗口会直接关掉，得让人看到结果
         return code
+    keeper = LocaleKeeper(config)       # 国服汉化：开着就一直保持（不管是不是从窗口点的启动）
+    if keeper.enabled:
+        logger.info(f"国服汉化已开启（{keeper.status()}）")
     try:
+        if IS_WINDOWS and not args.no_gui:
+            return run_with_window(companion, keeper)
         companion.run()
     except KeyboardInterrupt:
         logger.info("已退出。")
