@@ -650,14 +650,19 @@ class Companion:
             logger.warning(f"当前登录的 {name}#{tag} 是另一个 Discord 账号绑定的，但插件里的令牌属于"
                            f"{f'绑定了「{owner}」的' if owner else '另一个'} Discord 账号（令牌不能共用）。"
                            f"这个号打的比赛和开局情报都没法通过这个插件上报。"
-                           f"请让 {name} 的主人在 Discord 输入 /插件令牌，然后删掉插件文件夹里的 companion_config.json，"
-                           f"重开插件粘贴他自己的令牌。")
+                           f"如果 {name} 是你的号：用你自己的 Discord 账号输入 /插件令牌 拿你自己的令牌，"
+                           f"然后删掉插件文件夹里的 companion_config.json，重开插件粘贴新令牌。")
         elif self.bindings and not bound:
             self.account_issue = "这个号没绑定"
-            logger.warning(f"当前登录的账号 {name}#{tag} 没有在机器人上绑定，打完的比赛会被机器人忽略。"
-                           f"请在 Discord 用 /绑定 {name}#{tag} 绑定。"
-                           + (f"注意：插件里的令牌属于绑定了「{owner}」的 Discord 账号，{name} 要是别人的号，"
-                              f"得用 {name} 主人自己的 /插件令牌，令牌不能共用。" if owner else ""))
+            if owner:
+                logger.warning(f"当前登录的账号 {name}#{tag} 没有在机器人上绑定，打完的比赛会被机器人忽略。"
+                               f"插件里的令牌属于绑定了「{owner}」的 Discord 账号："
+                               f"如果你就是这个 Discord 账号，用 /绑定 {name}#{tag} 把这个号也绑上就行；"
+                               f"如果不是，用你自己的 Discord 账号 /绑定 {name}#{tag}，再输入 /插件令牌 拿你自己的令牌，"
+                               f"删掉插件文件夹里的 companion_config.json，重开插件粘贴新令牌（令牌不能共用）。")
+            else:
+                logger.warning(f"当前登录的账号 {name}#{tag} 没有在机器人上绑定，打完的比赛会被机器人忽略。"
+                               f"请在 Discord 用 /绑定 {name}#{tag} 绑定。")
         self.next_history_check = 0.0
         return True
 
