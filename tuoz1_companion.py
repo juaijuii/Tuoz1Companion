@@ -40,7 +40,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -1644,7 +1644,14 @@ class CompanionWindow:
             pass
 
     def _set_icon(self):
-        """标题栏 / 任务栏图标：深蓝底上一个金色六边形（换掉 Tk 默认的羽毛）"""
+        """标题栏 / 任务栏图标：和 exe 同一个 tuoz1.ico（打包时 --add-data 带进去）；找不到就画一个简化版，换掉 Tk 默认的羽毛"""
+        try:
+            ico = Path(getattr(sys, "_MEIPASS", "") or Path(__file__).resolve().parent) / "tuoz1.ico"
+            if ico.is_file():
+                self.root.iconbitmap(default=str(ico))
+                return
+        except Exception:
+            pass
         try:
             n = 32
             img = self.tk.PhotoImage(width=n, height=n)
