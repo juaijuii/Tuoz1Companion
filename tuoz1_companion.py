@@ -17,7 +17,7 @@ tuoz1_companion.py — Tuoz1 Bot 客户端插件（Tuoz1 Companion）
 再发给机器人存进你选的服务器的黑名单（要求你是那个服务器的管理员）。
 
 窗口（v1.7.0）：连上机器人后弹出一个小窗口（tkinter，标准库），黑色命令行窗口自动藏起来，
-点「完整日志」再显示。窗口里有「英雄联盟，启动！」按钮和「简中汉化」开关：
+点「完整日志」再显示。窗口里有「英雄联盟，启动！」按钮、「简中汉化」和「自动接受对局」开关：
 汉化 = 把 Riot 的 league_of_legends.live.product_settings.yaml 里的 locale 改成 zh_CN
 （简体中文的文字和语音），插件开着的时候 Riot 客户端改回去就再改过来。--no-gui 只用命令行。
 """
@@ -40,7 +40,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.7.4"
+VERSION = "1.7.5"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -1585,6 +1585,51 @@ class LocaleKeeper:
 
 
 # ----------------------------------------------------------------------------
+ACCEPT_POLL_SECONDS = 1       # 找到对局的确认框只有 10 秒左右，主循环 3 秒一次太慢，单独一个线程每秒看一眼
+
+
+class AutoAccepter:
+    """自动接受对局：找到对局弹出确认框时替玩家点「接受」。用的是客户端自己的接口（和手点一样），
+    已经点过接受 / 拒绝的不再动；关掉开关立刻停"""
+
+    def __init__(self, config: dict, companion):
+        self.config, self.companion = config, companion
+        self.last_try = 0.0
+        threading.Thread(target=self._loop, daemon=True, name="auto-accept").start()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.config.get("auto_accept"))
+
+    def set_enabled(self, on: bool) -> None:
+        self.config["auto_accept"] = bool(on)
+        save_config(self.config)
+        logger.info("自动接受对局：已开启" if on else "自动接受对局：已关闭")
+
+    def _loop(self):
+        while True:
+            time.sleep(ACCEPT_POLL_SECONDS)
+            lcu = self.companion.lcu
+            if not self.enabled or lcu is None:
+                continue
+            try:
+                self.check(lcu)
+            except Exception as e:
+                logger.debug(f"自动接受对局：{e}")
+
+    def check(self, lcu) -> bool:
+        """确认框开着、自己还没点（接受 / 拒绝都没点）→ 马上替他点接受。点完 3 秒内不重复点"""
+        if time.time() - self.last_try < 3:
+            return False
+        rc = lcu.get("/lol-matchmaking/v1/ready-check", timeout=3) or {}
+        if rc.get("state") != "InProgress" or rc.get("playerResponse") != "None":
+            return False
+        self.last_try = time.time()
+        lcu.post("/lol-matchmaking/v1/ready-check/accept", timeout=5)
+        logger.info("找到对局，已自动接受")
+        return True
+
+
 # 窗口：海克斯金色主题。插件本身照常在后台线程里跑，窗口只负责显示和启动游戏
 # ----------------------------------------------------------------------------
 HEX = {"bg": "#0A1428", "title": "#010A13", "gold": "#C8AA6E", "gold_hi": "#F0E6D2", "text": "#F0E6D2",
@@ -1625,8 +1670,8 @@ class CompanionWindow:
         self.px = max(1.0, root.winfo_fpixels("1i") / 96)
         root.title(f"托子的小警察 v{VERSION}")
         root.configure(bg=HEX["bg"])
-        root.minsize(int(380 * self.px), int(400 * self.px))
-        root.geometry(f"{int(400 * self.px)}x{int(410 * self.px)}")
+        root.minsize(int(380 * self.px), int(430 * self.px))
+        root.geometry(f"{int(400 * self.px)}x{int(445 * self.px)}")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._dark_title_bar()
         self._set_icon()
@@ -1729,6 +1774,20 @@ class CompanionWindow:
         self.hint = tk.Label(body, text="", bg=HEX["bg"], fg=HEX["muted"], font=(UI_FONT, 9), anchor="w", justify="left")
         self.hint.pack(fill="x", pady=(self._p(4), 0))
 
+        # 自动接受对局：和简中汉化同样的勾选框
+        self.accepter = getattr(self.companion, "accepter", None)
+        if self.accepter is not None:
+            acc = tk.Frame(body, bg=HEX["bg"], cursor="hand2")
+            acc.pack(fill="x", pady=(self._p(10), 0))
+            self.acc_box = tk.Label(acc, text="✓" if self.accepter.enabled else "", width=2, bg=HEX["bg"], fg=HEX["gold"],
+                                    font=(UI_FONT, 9, "bold"), highlightthickness=1,
+                                    highlightbackground=HEX["gold"], highlightcolor=HEX["gold"])
+            self.acc_box.pack(side="left")
+            acc_lbl = tk.Label(acc, text="自动接受对局", bg=HEX["bg"], fg=HEX["text"], font=(UI_FONT, 11))
+            acc_lbl.pack(side="left", padx=(self._p(8), 0))
+            for w in (acc, self.acc_box, acc_lbl):
+                w.bind("<Button-1>", lambda e: self.toggle_accept())
+
         # 大按钮：金色描边。鼠标移上去描边变亮、底色提一点；按下去底色压暗；点完 8 秒内显示「启动中…」
         self.btn_frame = tk.Frame(body, bg=HEX["gold"], cursor="hand2")
         self.btn_frame.pack(fill="x", pady=(self._p(16), 0))
@@ -1807,6 +1866,11 @@ class CompanionWindow:
                 logger.warning(msg)
             self.hint_override = (msg, time.time() + 6)
         threading.Thread(target=work, daemon=True).start()
+
+    def toggle_accept(self):
+        on = not self.accepter.enabled
+        self.acc_box.config(text="✓" if on else "")
+        threading.Thread(target=self.accepter.set_enabled, args=(on,), daemon=True).start()
 
     def toggle_zh(self):
         """勾选框马上变，改文件和查客户端进程放后台（查进程要一两百毫秒，别让窗口卡一下）"""
@@ -1997,6 +2061,9 @@ def main() -> int:
         pause_before_exit()      # 拖文件启动的窗口会直接关掉，得让人看到结果
         return code
     keeper = LocaleKeeper(config)       # 简中汉化：开着就一直保持（不管是不是从窗口点的启动）
+    companion.accepter = AutoAccepter(config, companion)
+    if companion.accepter.enabled:
+        logger.info("自动接受对局已开启")
     if keeper.enabled:
         logger.info(f"简中汉化已开启（{keeper.status()}）")
     try:
