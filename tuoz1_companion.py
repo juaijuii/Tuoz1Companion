@@ -46,7 +46,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -2140,19 +2140,28 @@ def aram_norm(text) -> str:
     return _ARAM_NORM_RE.sub("", str(text or "")).lower()
 
 
-def aram_table_index(table: dict) -> dict:
+def aram_table_index(table: dict, local_names: dict | None = None) -> dict:
     """把机器人给的整张海克斯表整理成认名字用的样子。
-    names：[(海克斯编号, "zh" / "en", 去掉标点的名字, 原样去空格的名字)]；exact：去掉标点的名字 -> names 里的下标"""
+    names：[(海克斯编号, "zh" / "en" / "local", 去掉标点的名字, 原样去空格的名字)]；exact：去掉标点的名字 -> names 里的下标。
+    local_names：{海克斯编号: 玩家自己客户端里的名字}。机器人只有大陆简体和英文两套名字，别的语言是另一套译名
+    （马来西亚简体的「钝击」就是大陆的「大力」），得照玩家客户端里的叫法才对得上；显示时也用这个叫法"""
     cards = {str(k): v for k, v in (table.get("cards") or {}).items() if isinstance(v, dict)}
-    names, exact = [], {}
+    names, exact, local = [], {}, {}
+
+    def add(aid, lang, name):
+        norm = aram_norm(name)
+        if norm:
+            exact.setdefault(norm, []).append(len(names))
+            names.append((aid, lang, norm, "".join(str(name).split()).lower()))
     for aid, card in cards.items():
-        for lang, key in (("zh", "name_zh"), ("en", "name_en")):
-            norm = aram_norm(card.get(key))
-            if norm:
-                exact.setdefault(norm, []).append(len(names))
-                names.append((aid, lang, norm, "".join(str(card.get(key)).split()).lower()))
+        add(aid, "zh", card.get("name_zh"))
+        add(aid, "en", card.get("name_en"))
+        mine = str((local_names or {}).get(aid) or "").strip()
+        if mine and aram_norm(mine) not in (aram_norm(card.get("name_zh")), aram_norm(card.get("name_en"))):
+            local[aid] = mine
+            add(aid, "local", mine)
     floor = table.get("min_score")
-    return {"cards": cards, "names": names, "exact": exact,
+    return {"cards": cards, "names": names, "exact": exact, "local": local,
             "prefer": {aid for aid, card in cards.items() if card.get("source") == "champion"},
             "min_score": float(floor) if isinstance(floor, (int, float)) else 0.6}
 
@@ -2219,6 +2228,11 @@ def aram_local_cards(reads_per_card: list, index: dict) -> list:
             data["name"] = data.get("name_en") or data.get("name")
             if data.get("combos"):
                 data["combos"] = [{**c, "with": c.get("with_en") or c.get("with")} for c in data["combos"] if isinstance(c, dict)]
+        elif best[2] == "local":                      # 对上的是玩家客户端里的叫法：名字和天胡搭档都用这套叫法
+            local = index.get("local") or {}
+            data["name"] = local.get(best[0]) or data.get("name")
+            if data.get("combos"):
+                data["combos"] = [{**c, "with": local.get(str(c.get("with_id"))) or c.get("with")} for c in data["combos"] if isinstance(c, dict)]
         card.update({"matched": True, "score": round(best[1], 3), **data})
         cards.append(card)
 
@@ -2460,6 +2474,7 @@ class AramAssistant:
         self._icons_retry: dict = {}       # 没读到的：英雄编号 -> 什么时候可以再试
         self._icon_tables: dict = {}       # "item" / "aug" -> {编号: 图标在客户端里的地址}
         self.tables: dict = {}             # 英雄编号 -> 这个英雄的整张海克斯表（本机认字时查它）
+        self._client_names: dict | None = None     # {海克斯编号: 玩家自己客户端里的名字}；None = 还没读到
         self.table_off_until = 0.0         # 机器人不支持整表接口（旧版本）：这之前别再问
         self._icons_lock = threading.Lock()
         self._report_timer = None          # 开关变了以后，过几秒向机器人补报一次的定时器
@@ -2875,6 +2890,22 @@ class AramAssistant:
                 return
             time.sleep(1.0 if loaded else 0.7)
 
+    def client_augment_names(self) -> dict:
+        """玩家自己客户端里每个海克斯叫什么（客户端当前语言）。读不到返回空表，下一局再试"""
+        if self._client_names is not None:
+            return self._client_names
+        try:
+            lcu = getattr(self.companion, "lcu", None)
+            rows = lcu.get("/lol-game-data/assets/v1/cherry-augments.json", timeout=8) if lcu else None
+            names = {str(r.get("id")): str(r.get("nameTRA")).strip() for r in rows or []
+                     if isinstance(r, dict) and isinstance(r.get("id"), int) and r.get("nameTRA")}
+            if names:
+                self._client_names = names
+                return names
+        except Exception as e:
+            logger.debug(f"海克斯助手：没读到客户端里的海克斯名字（{e}）")
+        return {}
+
     def _prepare_local(self, champion_id: int, game_id) -> None:
         """为本机认字做准备（读条时做，三选一出来时就都齐了）：加载认字模型，取这个英雄的整张海克斯表。
         哪样没成都没关系：到时候照旧把截图交给机器人认"""
@@ -2888,8 +2919,10 @@ class AramAssistant:
             if resp.get("ok") and resp.get("cards"):
                 if len(self.tables) > 8:
                     self.tables.pop(next(iter(self.tables)))
-                self.tables[champion_id] = aram_table_index(resp)
-                logger.info("海克斯助手：这局在本机认卡片，不用上传截图")
+                index = aram_table_index(resp, self.client_augment_names())
+                self.tables[champion_id] = index
+                extra = f"（另有 {len(index['local'])} 个按你客户端里的叫法来认）" if index["local"] else ""
+                logger.info("海克斯助手：这局在本机认卡片，不用上传截图" + extra)
         except HttpError as e:
             if e.status == 404:                       # 机器人还是旧版本，没有这个接口
                 self.table_off_until = time.time() + 3600
