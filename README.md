@@ -23,7 +23,13 @@
 python tuoz1_companion.py
 ```
 
-需要 Python 3.10 或更新版本。
+需要 Python 3.10 或更新版本。插件本身只用标准库；想让海克斯三选一在本机认字（更快，见下面），再装两个库：
+
+```bash
+pip install numpy onnxruntime
+```
+
+不装也能用，卡片标题会交给机器人认。
 
 ## 窗口、英雄联盟启动和简中汉化（v1.7.0）
 
@@ -70,7 +76,9 @@ python tuoz1_companion.py -v               # 详细日志
 
 把 League Akari 导出的「标记玩家」JSON 直接拖到 `Tuoz1Companion.exe` 图标上（或 `python tuoz1_companion.py --import-blacklist 文件`）。插件通过已登录的客户端把 puuid 换成名字，列出你绑定过的服务器让你选，然后发给机器人存进黑名单。只有你是管理员的服务器才能导入；已经在黑名单里的人只更新备注，新名字每条约 1.3 秒。
 
-从 v1.2.0 起插件会自动更新：启动时和每 6 小时检查一次新版本，自动下载替换并重启，配置和令牌不受影响。不想自动更新加 `--no-update`。
+从 v1.2.0 起插件会自动更新：自动下载替换并重启，配置和令牌不受影响。不想自动更新加 `--no-update`。
+
+什么时候检查新版本（v1.8.3 起）：启动时；每打完一局、战绩报完以后；闲着的时候每半小时一次。排到了等确认、选人、读条、对局中都不会更新，不会打断你。v1.8.2 及更早的版本是启动时和每 6 小时检查一次，想马上更新就关掉插件再打开。
 
 ## 工作原理
 
@@ -87,7 +95,9 @@ python tuoz1_companion.py -v               # 详细日志
   并在结算阶段读取 `/lol-end-of-game/v1/eog-stats-block` 补上治疗队友、护盾队友等字段。
 - 只上报比赛数据和当前账号的 puuid，令牌只用于向机器人证明"这是我"。
 - 海克斯助手：海克斯大乱斗对局中，在卡片可能出现的时候（开局、你死亡后、刚升到解锁的等级），插件每 0.35 秒截一下三张卡片标题所在的那三小条，先在你自己的电脑上判断像不像卡片标题；
-  像的时候（或者你按了热键）才把这三小条（灰度图，每条几 KB）发给机器人认字，机器人不保存这些图。
+  像的时候（或者你按了热键）才去认上面的字。
+  v1.9.0 起认字在你自己的电脑上完成（exe 里带着识别模型），截图不离开你的电脑；读条时插件会向机器人取一次你这个英雄的海克斯数据表，三选一时查这张表。
+  只有本机认不了的时候（模型加载失败，或者用源码运行又没装那两个库），才把这三小条（灰度图，每条几 KB）发给机器人认，机器人不保存这些图。
   别的模式、别的时候不截图。不读游戏内存，不向游戏发送任何按键或点击。
 - 使用统计（v1.8.1）：插件连机器人时会顺带报几个开关是开着还是关着（海克斯助手和它的三个细项、自动改无边框、十人战绩），
   只有开 / 关，没有别的内容；机器人主人用它看有多少人在用这些功能。
@@ -96,16 +106,13 @@ python tuoz1_companion.py -v               # 详细日志
 
 - 海克斯数据来自 [ARAMKit](https://aramkit.com)。
 - 找游戏窗口和卡片标题位置的比例参考了 [Nyx0ra/lol-aram-mayhem-hextech-helper](https://github.com/Nyx0ra/lol-aram-mayhem-hextech-helper)（MIT）。
-- 机器人那边认字用的是 PaddleOCR 的 PP-OCRv4 模型（Apache-2.0）。
+- 认字用的是 PaddleOCR 的 PP-OCRv4 模型（Apache-2.0），模型文件在 `assets/ocr/`，用 onnxruntime 运行。
 
 ## 自己打包
 
-```bash
-pip install pyinstaller
-pyinstaller --onefile --console --name Tuoz1Companion tuoz1_companion.py
-```
+直接运行 `build.bat`，产物在 `dist/Tuoz1Companion.exe`（约 43 MB，其中识别模型和运行库占了大半）。
 
-或者直接运行 `build.bat`，产物在 `dist/Tuoz1Companion.exe`。
+它会先在 `build/venv` 里建一个干净的环境，只装打包工具、`numpy` 和只用 CPU 的 `onnxruntime`，再打包。不要直接用系统 Python 打：系统里如果装的是带显卡加速的 `onnxruntime-gpu`，会把几百 MB 的显卡文件一起打进去。打完会自动跑一次 `--ocr-selftest`，确认模型和运行库都带上了。
 
 ## 许可
 
