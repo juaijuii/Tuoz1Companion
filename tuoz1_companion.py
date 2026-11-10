@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import difflib
 import json
 import logging
+import math
 import os
 import re
 import ssl
@@ -44,7 +46,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.8.2"
+VERSION = "1.9.0"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -57,7 +59,9 @@ LOG_PATH = APP_DIR / "companion.log"
 UPDATE_REPO = "juaijuii/Tuoz1Companion"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_ASSET = "Tuoz1Companion.exe"
-UPDATE_CHECK_SECONDS = 6 * 3600
+UPDATE_CHECK_SECONDS = 30 * 60      # 闲着的时候多久看一次有没有新版本（另外每打完一局、战绩报完以后马上看一次）
+# 这些阶段不更新（更新要重启插件，几秒钟里什么都干不了）：排到了等确认、选人、读条、对局中、等结算
+UPDATE_BUSY_PHASES = {"ReadyCheck", "ChampSelect", "GameStart", "InProgress", "Reconnect", "WaitingForStats", "PreEndOfGame"}
 IN_GAME_PHASES = {"InProgress", "Reconnect"}
 EOG_PHASES = {"WaitingForStats", "PreEndOfGame", "EndOfGame"}
 EOG_WAIT_SECONDS = 150   # 游戏结束后最多等这么久拿赛后统计（治疗/护盾队友），超时就不带它上报
@@ -489,6 +493,13 @@ class BotAPI:
     def get_aram_tiers(self) -> dict:
         return _http_json("GET", self.server + "/api/companion/aram/tiers", self.headers, timeout=15) or {}
 
+    def get_aram_table(self, champion_id: int, game_id=None) -> dict:
+        """这个英雄的全部海克斯数据（本机认字时用：三选一时查这张表，不用再问机器人）"""
+        url = self.server + f"/api/companion/aram/table?champion={int(champion_id)}"
+        if isinstance(game_id, int) and game_id > 0:
+            url += f"&game_id={game_id}"
+        return _http_json("GET", url, self.headers, timeout=15) or {}
+
     def get_aram_champion(self, champion_id: int) -> dict:
         return _http_json("GET", self.server + f"/api/companion/aram/champion?id={int(champion_id)}", self.headers, timeout=15) or {}
 
@@ -649,6 +660,7 @@ class Companion:
         self.eog_wait_until = 0.0                          # 游戏结束后等待赛后统计的截止时间
         self.next_retry_check = 0.0                        # 补报（不在语音频道）的下一次尝试时间，固定 60 秒间隔
         self.next_update_check = time.time() + UPDATE_CHECK_SECONDS
+        self.update_after_game = False             # 刚打完一局：战绩报完、回到大厅以后马上看一次有没有新版本
         self.config.setdefault("last_game_ids", {})
         self.config.setdefault("sent_game_ids", [])
 
@@ -1196,6 +1208,16 @@ class Companion:
             return "retry"        # 有一个服务器还没进语音就继续补报；已经播过的服务器会回 already_processed，无害
         return True
 
+    def update_due(self, now: float, phase: str) -> bool:
+        """现在该不该去看有没有新版本。两个时机：刚打完一局（战绩报完以后），或者闲着满了 UPDATE_CHECK_SECONDS。
+        忙的时候不看——更新要重启插件：选人时侧栏会没掉，对局中标注会没掉；战绩还没报完的话重启会把它丢了。
+        排队时可以更新，但开着「自动接受对局」的人不行（重启那几秒正好排到就接不上了）"""
+        if phase in UPDATE_BUSY_PHASES or self.pending_game_ids or self.retry_uploads:
+            return False
+        if phase == "Matchmaking" and getattr(getattr(self, "accepter", None), "enabled", False):
+            return False
+        return self.update_after_game or now >= self.next_update_check
+
     # --- 主循环 ---
     def run(self) -> None:
         interval = max(15, int(self.args.interval))
@@ -1241,6 +1263,7 @@ class Companion:
                     if self.current_game_id and self.current_game_id not in self.pending_game_ids:
                         self.pending_game_ids.append(self.current_game_id)
                     self.current_game_id = None
+                    self.update_after_game = True
                     self.post_game_deadline = now + POST_GAME_WINDOW_SECONDS
                     self.eog_wait_until = now + EOG_WAIT_SECONDS
                     self.next_history_check = now + POST_GAME_FAST_POLL_SECONDS
@@ -1257,9 +1280,8 @@ class Companion:
                 self.eog_wait_until = now
                 self.next_history_check = min(self.next_history_check, now)
 
-            if (now >= self.next_update_check and phase not in IN_GAME_PHASES
-                    and not self.pending_game_ids and not self.retry_uploads):
-                self.next_update_check = now + UPDATE_CHECK_SECONDS
+            if self.update_due(now, phase):
+                self.next_update_check, self.update_after_game = now + UPDATE_CHECK_SECONDS, False
                 if check_for_update(not self.args.no_update):
                     return  # 已切换到新版本，本进程退出
 
@@ -1945,6 +1967,274 @@ def aram_fingerprint(bgra: bytes, width: int, height: int) -> tuple[bool, tuple]
     return looks, (mask, total)
 
 
+# ----------------------------------------------------------------------------
+# 本机认字：三选一的卡片标题在自己电脑上认，不用把截图传给机器人，也不用等网络
+# ----------------------------------------------------------------------------
+ARAM_OCR_MODEL = "assets/ocr/ch_PP-OCRv4_rec_infer.onnx"
+ARAM_LOCAL_RECHECK = 0.3        # 本机认一次只要几十毫秒：两次之间隔这么久就够了
+ARAM_TIER_ORDER = {"S": 0, "A": 1, "B": 2, "C": 3, "D": 4}
+_ARAM_NORM_RE = re.compile(r"[\s·•:：!！?？\-—_'’`\".,，。、()（）\[\]【】<>《》/\\|]+")
+
+
+def resource_path(rel: str) -> Path:
+    """随插件带着的文件在哪：打包成 exe 时在解包目录里，用源码跑时在脚本旁边"""
+    return Path(getattr(sys, "_MEIPASS", "") or Path(__file__).resolve().parent) / rel
+
+
+class LocalOcr:
+    """PP-OCRv4 的文字识别模型（中英文），用 onnxruntime 在 CPU 上跑。输入一行字的图，输出是哪些字。
+    需要 numpy 和 onnxruntime 两个库：打包好的 exe 里自带；用源码跑要自己 pip install。
+    库或模型不在时 ready 一直是 False，插件照旧把截图交给机器人认"""
+
+    def __init__(self):
+        self.session = None
+        self.error = ""
+        self.lock = threading.Lock()
+        self.np = None
+        self.input = ""
+        self.chars: list = []
+
+    @property
+    def ready(self) -> bool:
+        return self.session is not None
+
+    def load(self) -> bool:
+        """加载模型（要零点几秒，别在界面线程里调）。成功返回 True；失败记下原因，以后不再试"""
+        with self.lock:
+            if self.session is not None:
+                return True
+            if self.error:
+                return False
+            try:
+                import numpy as np
+                import onnxruntime as ort
+                path = resource_path(ARAM_OCR_MODEL)
+                if not path.exists():
+                    raise FileNotFoundError(f"没有模型文件 {path.name}")
+                ort.set_default_logger_severity(3)
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads = 2        # 只认三小条，别和游戏抢 CPU
+                opts.inter_op_num_threads = 1
+                session = ort.InferenceSession(str(path), sess_options=opts, providers=["CPUExecutionProvider"])
+                chars = session.get_modelmeta().custom_metadata_map.get("character", "").splitlines()
+                if len(chars) < 100:
+                    raise RuntimeError("识别模型里没有字表")
+                self.np, self.input, self.chars = np, session.get_inputs()[0].name, ["", *chars, " "]   # 0 号是空白
+                self.session = session
+                return True
+            except Exception as e:
+                self.error = f"{type(e).__name__} {str(e)[:160]}"
+                return False
+
+    def _resize(self, gray, out_w: int):
+        """把一行字缩放到高 48、宽 out_w。缩小时按缩小的倍数把取样范围放宽（不然 4K 屏上的字缩下来会缺笔画）"""
+        np = self.np
+
+        def weights(src: int, dst: int):
+            scale = src / dst
+            support = max(1.0, scale)
+            centers = (np.arange(dst, dtype=np.float32) + 0.5) * scale
+            w = 1.0 - np.abs((np.arange(src, dtype=np.float32)[None, :] + 0.5 - centers[:, None]) / support)
+            w = np.clip(w, 0.0, None)
+            return w / w.sum(axis=1, keepdims=True)
+        h, w = gray.shape
+        return weights(h, 48) @ gray.astype(np.float32) @ weights(w, out_w).T
+
+    def line(self, gray) -> tuple[str, float]:
+        """gray：二维 uint8 数组，一行字。返回 (文字, 平均把握)"""
+        np = self.np
+        h, w = gray.shape
+        if h < 4 or w < 4:
+            return "", 0.0
+        rw = max(8, min(1600, int(math.ceil(48 * w / h))))
+        img = (self._resize(gray, rw) / 255.0 - 0.5) / 0.5
+        canvas = np.zeros((1, 3, 48, max(320, rw)), dtype=np.float32)     # 右边补黑到至少 320 宽，和训练时一样
+        canvas[0, :, :, :rw] = img
+        probs = self.session.run(None, {self.input: canvas})[0][0]          # (时间步, 字表大小)
+        idx, conf = probs.argmax(axis=1).tolist(), probs.max(axis=1).tolist()
+        out, scores, prev = [], [], 0
+        for i, p_ in zip(idx, conf):
+            if i != prev and i != 0:                 # 相邻重复的合并，空白的去掉
+                out.append(self.chars[i] if i < len(self.chars) else "")
+                scores.append(p_)
+            prev = i
+        return "".join(out).strip(), (sum(scores) / len(scores) if scores else 0.0)
+
+    def text_lines(self, gray) -> list:
+        """把标题条里有字的那几行框出来：字是亮的、卡片底是暗的。返回 [(上, 下, 左, 右)]，从上到下"""
+        np = self.np
+        h, w = gray.shape
+        bg, hi = float(np.median(gray)), float(np.percentile(gray, 99.5))
+        if hi - bg < 45:                              # 整条差不多一个颜色：没有字
+            return []
+        mask = gray > bg + (hi - bg) * 0.5
+        rows = mask.sum(axis=1) >= max(2, w // 200)
+        runs, start = [], None
+        for y in range(h + 1):
+            on = y < h and bool(rows[y])
+            if on and start is None:
+                start = y
+            elif not on and start is not None:
+                runs.append((start, y))
+                start = None
+        if not runs:
+            return []
+        merged = [list(runs[0])]
+        for a, b in runs[1:]:                         # 一个字的上下两半中间断一两行，并回去
+            if a - merged[-1][1] <= max(1, h // 40):
+                merged[-1][1] = b
+            else:
+                merged.append([a, b])
+        tall = max(b - a for a, b in merged)
+        boxes = []
+        for a, b in merged:
+            if b - a < max(6, tall * 0.55):           # 比最高那行矮很多的是杂点、边框
+                continue
+            cols = np.where(mask[a:b].sum(axis=0) > 0)[0]
+            if len(cols) < 4:
+                continue
+            pad_y, pad_x = max(2, (b - a) // 4), max(4, (b - a) // 2)
+            boxes.append((max(0, a - pad_y), min(h, b + pad_y), max(0, int(cols[0]) - pad_x), min(w, int(cols[-1]) + 1 + pad_x)))
+        return boxes[:3]
+
+    def read(self, bgra: bytes, width: int, height: int, enough=None) -> list:
+        """一条标题截图（BGRA 像素）-> 几种读法 [(文字, 把握)]：按行框出来读的、整条直接读的。哪种对得上名字用哪种。
+        enough(文字)：按行读出来的已经够用了（比如和某个名字一字不差）就返回 True，整条那一遍就不读了，省一半时间"""
+        np = self.np
+        if width < 8 or height < 8 or len(bgra) < width * height * 4:
+            return []
+        # 只取绿色通道，和传给机器人时一样
+        gray = np.ascontiguousarray(np.frombuffer(bgra, dtype=np.uint8, count=width * height * 4).reshape(height, width, 4)[:, :, 1])
+        reads = []
+        boxes = self.text_lines(gray)
+        if boxes:
+            parts = [self.line(np.ascontiguousarray(gray[t:b, l:r])) for t, b, l, r in boxes]
+            parts = [x for x in parts if x[0]]
+            if parts:
+                reads.append(("".join(x[0] for x in parts), sum(x[1] for x in parts) / len(parts)))
+                if len(parts) > 1:                    # 英文名字折成两行时中间要有空格
+                    reads.append((" ".join(x[0] for x in parts), sum(x[1] for x in parts) / len(parts)))
+                if enough is not None and any(enough(text) for text, _ in reads):
+                    return reads
+        whole = self.line(gray)
+        if whole[0]:
+            reads.append(whole)
+        return reads
+
+
+LOCAL_OCR = LocalOcr()
+
+
+def ocr_selftest() -> int:
+    """--ocr-selftest：打包以后检查认字模型和运行库是不是都带上了、能不能跑。能跑返回 0"""
+    started = time.time()
+    if not LOCAL_OCR.load():
+        print(f"OCR FAIL: {LOCAL_OCR.error}")
+        return 1
+    reads = LOCAL_OCR.read(bytes(260 * 92 * 4), 260, 92)       # 一条全黑的图：应该什么都读不到
+    print(f"OCR OK: {len(LOCAL_OCR.chars)} chars, load {time.time() - started:.2f}s, blank -> {reads}")
+    return 0 if not reads else 1
+
+
+def aram_norm(text) -> str:
+    return _ARAM_NORM_RE.sub("", str(text or "")).lower()
+
+
+def aram_table_index(table: dict) -> dict:
+    """把机器人给的整张海克斯表整理成认名字用的样子。
+    names：[(海克斯编号, "zh" / "en", 去掉标点的名字, 原样去空格的名字)]；exact：去掉标点的名字 -> names 里的下标"""
+    cards = {str(k): v for k, v in (table.get("cards") or {}).items() if isinstance(v, dict)}
+    names, exact = [], {}
+    for aid, card in cards.items():
+        for lang, key in (("zh", "name_zh"), ("en", "name_en")):
+            norm = aram_norm(card.get(key))
+            if norm:
+                exact.setdefault(norm, []).append(len(names))
+                names.append((aid, lang, norm, "".join(str(card.get(key)).split()).lower()))
+    floor = table.get("min_score")
+    return {"cards": cards, "names": names, "exact": exact,
+            "prefer": {aid for aid, card in cards.items() if card.get("source") == "champion"},
+            "min_score": float(floor) if isinstance(floor, (int, float)) else 0.6}
+
+
+def aram_match(text: str, index: dict) -> tuple:
+    """读到的字是哪个海克斯：(编号, 相似度, "zh" / "en")；对不上是 (None, 分数, "")。和机器人上是同一套规则"""
+    t = aram_norm(text)
+    raw = "".join(str(text or "").split()).lower()
+    if not t:
+        return None, 0.0, ""
+    prefer, best = index["prefer"], (None, 0.0, "")
+    hits = index["exact"].get(t)
+    if hits:                                          # 一字不差（绝大多数时候走这里）
+        for i in hits:
+            aid, lang, _, name_raw = index["names"][i]
+            # 「罪恶快感」和「罪恶快感！」是两个海克斯，去掉标点后一样：连标点都一样的那个优先
+            score = 1.0 + (0.01 if name_raw == raw else 0.0) + (0.015 if aid in prefer else 0.0)
+            if score > best[1]:
+                best = (aid, score, lang)
+        return best[0], min(best[1], 1.0), best[2]
+    if len(t) < 2:
+        return None, 0.0, ""                          # 只读到一个字：不猜
+    matcher = difflib.SequenceMatcher()
+    matcher.set_seq2(t)
+    for aid, lang, norm, _ in index["names"]:
+        matcher.set_seq1(norm)
+        score = 0.0
+        if matcher.real_quick_ratio() >= 0.5 and matcher.quick_ratio() >= 0.5:
+            score = matcher.ratio()
+        if len(norm) >= 3 and norm in t and len(norm) / len(t) >= 0.5:
+            score = max(score, 0.92)                  # 多读了旁边的字（标签、边框当成了字）：名字整个包含在里面就算对上
+        if score <= 0:
+            continue
+        if aid in prefer:
+            score += 0.015
+        if score > best[1]:
+            best = (aid, score, lang)
+    if best[1] < index["min_score"]:
+        return None, best[1], ""
+    return best[0], min(best[1], 1.0), best[2]
+
+
+def aram_local_cards(reads_per_card: list, index: dict) -> list:
+    """三张卡各自的几种读法 -> 和机器人回的一样格式的三张卡的结果（并标出推荐的那张）"""
+    cards = []
+    for slot, reads in enumerate(reads_per_card):
+        card = {"slot": slot, "matched": False, "text": ""}
+        if not reads:
+            card["error"] = "no_text"
+            cards.append(card)
+            continue
+        best = (None, 0.0, "", "")
+        for text, _conf in reads:
+            aid, score, lang = aram_match(text, index)
+            if aid and score > best[1]:
+                best = (aid, score, lang, text)
+        card["text"] = (best[3] or reads[0][0])[:40]
+        if not best[0]:
+            card["error"] = "unknown_name"
+            cards.append(card)
+            continue
+        data = dict(index["cards"][best[0]])
+        if best[2] == "en":                           # 卡片是英文的：名字和天胡搭档都用英文
+            data["name"] = data.get("name_en") or data.get("name")
+            if data.get("combos"):
+                data["combos"] = [{**c, "with": c.get("with_en") or c.get("with")} for c in data["combos"] if isinstance(c, dict)]
+        card.update({"matched": True, "score": round(best[1], 3), **data})
+        cards.append(card)
+
+    def order(c):
+        # 先比梯队；梯队一样时这个英雄自己的数据优先，再比排名
+        tier = ARAM_TIER_ORDER.get(str(c.get("tier") or "").upper(), len(ARAM_TIER_ORDER))
+        src = {"champion": 0, "global": 1}.get(c.get("source"), 2)
+        return tier, src, c["rank"] if isinstance(c.get("rank"), (int, float)) else 10 ** 6
+    ranked = sorted((c for c in cards if c["matched"] and c.get("source") != "none"), key=order)
+    for c in cards:
+        c["best"] = bool(ranked) and c is ranked[0]
+        if c["best"]:
+            c["trap"] = False                          # 三张里最好的那张不再标陷阱
+    return cards
+
+
 def aram_same(a, b) -> bool:
     """两次截的三条标题是不是同样的字：每一条亮点位置不一样的地方都不到亮点数的四分之一。
     故意比得细：重掷只换一张卡、新旧名字长短差不多时也要看得出来；宁可多重认一次，也不能留着旧的标注"""
@@ -2169,6 +2459,8 @@ class AramAssistant:
         self._icons_busy: set = set()      # 正在读的
         self._icons_retry: dict = {}       # 没读到的：英雄编号 -> 什么时候可以再试
         self._icon_tables: dict = {}       # "item" / "aug" -> {编号: 图标在客户端里的地址}
+        self.tables: dict = {}             # 英雄编号 -> 这个英雄的整张海克斯表（本机认字时查它）
+        self.table_off_until = 0.0         # 机器人不支持整表接口（旧版本）：这之前别再问
         self._icons_lock = threading.Lock()
         self._report_timer = None          # 开关变了以后，过几秒向机器人补报一次的定时器
         self._report_lock = threading.Lock()
@@ -2565,6 +2857,9 @@ class AramAssistant:
                 logger.debug(f"英雄攻略：{e}")
 
         threading.Thread(target=players, daemon=True, name="aram-players").start()
+        if data["mayhem"] and info.get("champion_id") and self.enabled and self.option("aram_local_ocr"):
+            threading.Thread(target=self._prepare_local, args=(info["champion_id"], game_id), daemon=True,
+                             name="aram-table").start()
         if data["mayhem"] and info.get("champion_id") and self.enabled and self.option("aram_panel"):
             threading.Thread(target=guide, daemon=True, name="aram-guide").start()     # AI 最慢，最先出发
             threading.Thread(target=card, daemon=True, name="aram-card").start()
@@ -2579,6 +2874,36 @@ class AramAssistant:
                 self.events.put(("started", game_id))
                 return
             time.sleep(1.0 if loaded else 0.7)
+
+    def _prepare_local(self, champion_id: int, game_id) -> None:
+        """为本机认字做准备（读条时做，三选一出来时就都齐了）：加载认字模型，取这个英雄的整张海克斯表。
+        哪样没成都没关系：到时候照旧把截图交给机器人认"""
+        try:
+            if not LOCAL_OCR.load():
+                logger.debug(f"海克斯助手：本机认字用不了（{LOCAL_OCR.error}），照旧交给机器人认")
+                return
+            if champion_id in self.tables or time.time() < self.table_off_until:
+                return
+            resp = self.bot.get_aram_table(champion_id, game_id)
+            if resp.get("ok") and resp.get("cards"):
+                if len(self.tables) > 8:
+                    self.tables.pop(next(iter(self.tables)))
+                self.tables[champion_id] = aram_table_index(resp)
+                logger.info("海克斯助手：这局在本机认卡片，不用上传截图")
+        except HttpError as e:
+            if e.status == 404:                       # 机器人还是旧版本，没有这个接口
+                self.table_off_until = time.time() + 3600
+            logger.debug(f"海克斯助手：没取到整张海克斯表（机器人回 {e.status}），照旧交给机器人认")
+        except Exception as e:
+            logger.debug(f"海克斯助手：没取到整张海克斯表（{e}），照旧交给机器人认")
+
+    def local_index(self, champion_id=None) -> dict | None:
+        """这局能不能在本机认：模型加载好了、这个英雄的表也取到了，就返回那张表；否则 None"""
+        if not LOCAL_OCR.ready or not self.option("aram_local_ocr"):
+            return None
+        if champion_id is None:
+            champion_id = (self.game_info() or {}).get("champion_id")
+        return self.tables.get(champion_id)
 
     @staticmethod
     def _shoot(layout: dict) -> tuple[list, tuple, int]:
@@ -2694,11 +3019,14 @@ class AramAssistant:
             return
         if not self.option("aram_auto"):
             return                                # 自动标注关了：只有按热键才认（认出来以后上面那段照样盯着卡片）
-        if looks < 3 or not stable or self.busy or now < self.next_upload or now < self.auto_off_until:
+        local = self.local_index() is not None
+        # 交给机器人认的时候要等画面停稳了再发（一来一回不便宜）；本机认只要几十毫秒，卡片还在翻就可以先认着，
+        # 不过没停稳时要三张都认出来才显示（见 _recognize 的 strict）
+        if looks < 3 or (not stable and not local) or self.busy or now < self.next_upload or now < self.auto_off_until:
             return
         if self.neg_bits is not None and now < self.neg_until and aram_same(bits, self.neg_bits):
-            return                                # 这个画面刚问过，机器人说不是卡片
-        self._start(layout, shots, bits, auto=True)
+            return                                # 这个画面刚认过，不是卡片
+        self._start(layout, shots, bits, auto=True, strict=not stable)
 
     def press(self) -> None:
         """热键：马上认一次"""
@@ -2714,14 +3042,15 @@ class AramAssistant:
         logger.info(f"海克斯助手：按了 {self.hotkey_name}，三张卡里有 {looks} 张看着像标题，正在识别")
         self._start(layout, shots, bits, auto=False)
 
-    def _start(self, layout: dict, shots: list, bits: tuple, auto: bool) -> None:
+    def _start(self, layout: dict, shots: list, bits: tuple, auto: bool, strict: bool = False) -> None:
         self.busy = True
-        self.next_upload = time.time() + ARAM_RECHECK_SECONDS
-        threading.Thread(target=self._recognize, args=(layout, shots, bits, auto), daemon=True,
+        self.next_upload = time.time() + (ARAM_LOCAL_RECHECK if self.local_index() is not None else ARAM_RECHECK_SECONDS)
+        threading.Thread(target=self._recognize, args=(layout, shots, bits, auto, strict), daemon=True,
                          name="aram-recognize").start()
 
-    def _recognize(self, layout: dict, shots: list, bits: tuple, auto: bool) -> None:
-        """把三条标题发给机器人认。auto=True 是自动扫到的：认不出来就悄悄算了，不在游戏画面上弹提示"""
+    def _recognize(self, layout: dict, shots: list, bits: tuple, auto: bool, strict: bool = False) -> None:
+        """认三条标题：能在本机认就在本机认，否则发给机器人。auto=True 是自动扫到的：认不出来就悄悄算了，
+        不在游戏画面上弹提示。strict=True 是画面还没停稳时认的：三张都认出来才显示，免得翻到一半的卡标成「没认出来」"""
         try:
             info = self.game_info() or {}
             if not info.get("champion_id"):
@@ -2731,14 +3060,25 @@ class AramAssistant:
             if not auto:
                 self.events.put(("busy", layout))
             started = time.time()
-            images = [base64.b64encode(png_gray(raw, width, height)).decode() for raw, width, height in shots]
-            resp = self.bot.post_aram_augments({
-                "companion_version": VERSION, "game_id": info.get("game_id"), "champion_id": info["champion_id"],
-                "game_mode": info.get("game_mode"), "queue_id": info.get("queue_id"),
-                "screen": list(layout["client"][2:]), "auto": auto, "images": images})
-            cards = [c for c in resp.get("cards") or [] if isinstance(c, dict)]
+            index, local, cards = self.local_index(info["champion_id"]), False, []
+            if index is not None:
+                try:
+                    exact = index["exact"]
+                    cards = aram_local_cards([LOCAL_OCR.read(raw, width, height, lambda text: aram_norm(text) in exact)
+                                              for raw, width, height in shots], index)
+                    local = True
+                except Exception as e:                # 本机认出了岔子：这一次交给机器人
+                    logger.debug(f"海克斯助手：本机认字出错（{e}），这次交给机器人")
+            if not local:
+                images = [base64.b64encode(png_gray(raw, width, height)).decode() for raw, width, height in shots]
+                resp = self.bot.post_aram_augments({
+                    "companion_version": VERSION, "game_id": info.get("game_id"), "champion_id": info["champion_id"],
+                    "game_mode": info.get("game_mode"), "queue_id": info.get("queue_id"),
+                    "screen": list(layout["client"][2:]), "auto": auto, "images": images})
+                cards = [c for c in resp.get("cards") or [] if isinstance(c, dict)]
             matched = sum(1 for c in cards if c.get("matched"))
-            if matched >= (2 if auto else 1):
+            where = "本机" if local else "机器人"
+            if matched >= (3 if auto and strict else 2 if auto else 1):
                 self.events.put(("cards", layout, cards))
                 self.shown_bits, self.miss = bits, 0
                 self._note_cards(cards)               # 还是同一次（重掷、收起又打开），还是已经换成下一次了
@@ -2746,18 +3086,24 @@ class AramAssistant:
                 names = tuple(aram_card_line(c) for c in cards)
                 if names != self.last_names:
                     self.last_names, self.same_streak = names, 0
-                    logger.info("海克斯：" + " / ".join(names) + f"（{int((time.time() - started) * 1000)} 毫秒）")
-                else:                                     # 画面动了但卡没换（多半是鼠标悬停）：下次重认往后推，最多隔 6 秒
+                    logger.info("海克斯：" + " / ".join(names) + f"（{where} {int((time.time() - started) * 1000)} 毫秒）")
+                else:                                     # 画面动了但卡没换（多半是鼠标悬停）：下次重认往后推，最多隔 6 秒（本机认的 1.5 秒）
                     self.same_streak += 1
-                    self.next_upload = time.time() + min(6.0, ARAM_RECHECK_SECONDS * 2 ** min(self.same_streak, 3))
+                    self.next_upload = time.time() + (min(1.5, ARAM_LOCAL_RECHECK * 2 ** min(self.same_streak, 3)) if local
+                                                      else min(6.0, ARAM_RECHECK_SECONDS * 2 ** min(self.same_streak, 3)))
             elif auto:
-                logger.debug("海克斯助手：自动上传了一次，机器人没认出名字：" + " / ".join(str(c.get("text") or "") for c in cards))
+                logger.debug(f"海克斯助手：自动认了一次（{where}），没对上名字：" + " / ".join(str(c.get("text") or "") for c in cards))
                 # 本机觉得像、机器人认不出名字：多半不是海克斯三选一（或者卡片还在翻）。记下这个画面，越是连着白发越晚再发。
                 # 三张都读到了字、却一张都对不上的，是别的三选一（属性碎片）或商店：这个画面一分钟内不再问，别的画面也多等一会儿
                 wrong = matched == 0 and sum(1 for c in cards if c.get("text")) >= 2
-                self.neg_bits, self.neg_until = bits, time.time() + (60 if wrong else 30)
-                self.neg_streak += 2 if wrong else 1
-                self.next_upload = time.time() + min(15.0, ARAM_RECHECK_SECONDS * 2 ** min(self.neg_streak, 4))
+                if local:
+                    # 本机认的不花网络：只记住「这个画面不是」，别的画面马上可以再认（卡片翻到一半时就是这样，下一眼就认出来了）
+                    self.neg_bits, self.neg_until = bits, time.time() + (60 if wrong else 3)
+                    self.next_upload = time.time() + ARAM_LOCAL_RECHECK
+                else:
+                    self.neg_bits, self.neg_until = bits, time.time() + (60 if wrong else 30)
+                    self.neg_streak += 2 if wrong else 1
+                    self.next_upload = time.time() + min(15.0, ARAM_RECHECK_SECONDS * 2 ** min(self.neg_streak, 4))
             elif matched == 0 and sum(1 for c in cards if c.get("text")) >= 2:
                 logger.info("海克斯助手：这三张不是海克斯（读到的是 " + " / ".join(str(c.get("text") or "") for c in cards) + "）")
                 self.events.put(("msg", layout, "这三张不是海克斯，没有推荐"))
@@ -4536,8 +4882,12 @@ def main() -> int:
     parser.add_argument("--import-blacklist", metavar="文件", help="批量导入黑名单：League Akari 的标记玩家导出，或带 riot_id 的 JSON 列表")
     parser.add_argument("file", nargs="?", help=argparse.SUPPRESS)   # 把文件拖到 exe 上时，路径就在这里
     parser.add_argument("--no-gui", action="store_true", help="不开窗口，只用命令行")
+    parser.add_argument("--ocr-selftest", action="store_true", help="检查本机认字能不能用（模型和运行库在不在），然后退出")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
+
+    if args.ocr_selftest:
+        return ocr_selftest()
 
     setup_logging(args.verbose)
     logger.info(f"{APP_NAME} v{VERSION} — Tuoz1 Bot 客户端插件  (配置: {CONFIG_PATH})")
