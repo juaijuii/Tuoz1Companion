@@ -20,6 +20,10 @@ tuoz1_companion.py — Tuoz1 Bot 客户端插件（Tuoz1 Companion）
 点「完整日志」再显示。窗口里有「英雄联盟，启动！」按钮、「简中汉化」和「自动接受对局」开关：
 汉化 = 把 Riot 的 league_of_legends.live.product_settings.yaml 里的 locale 改成 zh_CN
 （简体中文的文字和语音），插件开着的时候 Riot 客户端改回去就再改过来。--no-gui 只用命令行。
+
+海克斯助手（v1.8.0）：海克斯大乱斗里三选一出来时，插件自动截下三张卡的标题发给机器人认，
+机器人回每张卡对你这个英雄的梯队和排名，插件把它标在卡片上方，推荐的那张描边变亮，选完自动消失。
+自动没认出来可以按 F6 手动认一次（只在海克斯大乱斗对局中占用 F6）；截图用系统自带的接口，游戏要用无边框模式。
 """
 from __future__ import annotations
 
@@ -40,9 +44,9 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.7.5"
+VERSION = "1.8.0"
 PROTOCOL_VERSION = 1
-SERVER_URL = "http://nas.tianshi.lu:5016"     # 机器人地址写死；--server 只能临时覆盖，不会写进配置
+SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
 IS_WINDOWS = sys.platform.startswith("win")
 IS_FROZEN = bool(getattr(sys, "frozen", False))
@@ -294,6 +298,11 @@ def _http_json(method: str, url: str, headers: dict, body: dict | None = None,
     return json.loads(raw.decode("utf-8", "ignore"))
 
 
+_HISTORY_GUARD = threading.Lock()
+_HISTORY_LOCKS: dict = {}                       # puuid -> 锁：同一个人的战绩同时只查一次
+_HISTORY_SLOTS = threading.Semaphore(4)         # 查别人战绩的请求同时最多 4 个
+
+
 class LCU:
     def __init__(self, port: int, token: str):
         base_override = os.environ.get("COMPANION_LCU_BASE")
@@ -308,6 +317,18 @@ class LCU:
 
     def post(self, path: str, timeout: float = 15):
         return _http_json("POST", self.base + path, self.headers, timeout=timeout, ssl_context=self.ctx)
+
+    def patch(self, path: str, body: dict, timeout: float = 15):
+        return _http_json("PATCH", self.base + path, self.headers, body=body, timeout=timeout, ssl_context=self.ctx)
+
+    def get_bytes(self, path: str, timeout: float = 5) -> bytes:
+        """读一个文件的原始内容（比如英雄头像图），不当 JSON 解析"""
+        req = urllib.request.Request(self.base + path, headers=self.headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=self.ctx) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            raise HttpError(e.code, "") from None
 
     # --- 常用接口 ---
     def gameflow_phase(self) -> str:
@@ -337,8 +358,29 @@ class LCU:
 
     def match_history(self, puuid: str, count: int = 20) -> list[dict]:
         """任意玩家（puuid）最近 count 局。客户端里点开别人的战绩用的就是这个接口"""
-        data = self.get(f"/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex={count - 1}", timeout=15) or {}
-        return ((data.get("games") or {}).get("games")) or []
+        # 开局情报和十人战绩都要查对面的人：两分钟内查过的直接用，不让客户端重复去问
+        # 而且同一个人同时只问一次（后到的等先到的结果），全插件同时最多 4 个请求：
+        # 读条时客户端本来就忙，一口气问十几个人的战绩会把它卡到连「现在什么阶段」都答不上来
+        cache = self.__dict__.setdefault("_history_cache", {})
+        hit = cache.get((puuid, count))
+        if hit and time.time() - hit[0] < 120:
+            return hit[1]
+        with _HISTORY_GUARD:
+            lock = _HISTORY_LOCKS.setdefault(puuid, threading.Lock())
+        with lock:
+            hit = cache.get((puuid, count))
+            if hit and time.time() - hit[0] < 120:
+                return hit[1]
+            with _HISTORY_SLOTS:
+                data = self.get(f"/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex={count - 1}", timeout=15) or {}
+            games = ((data.get("games") or {}).get("games")) or []
+            cache[(puuid, count)] = (time.time(), games)
+        for key in [k for k, v in list(cache.items()) if time.time() - v[0] > 300]:
+            cache.pop(key, None)
+        if len(_HISTORY_LOCKS) > 200:
+            with _HISTORY_GUARD:
+                _HISTORY_LOCKS.clear()
+        return games
 
     def game_details(self, game_id: int) -> dict:
         return self.get(f"/lol-match-history/v1/games/{game_id}", timeout=30) or {}
@@ -420,6 +462,20 @@ class BotAPI:
 
     def post_scout(self, payload: dict) -> dict:
         return _http_json("POST", self.server + "/api/companion/scout", self.headers, body=payload, timeout=30) or {}
+
+    def post_aram_augments(self, payload: dict) -> dict:
+        # 海克斯助手：三选一只有几十秒，等不到就算了，让玩家再按一次
+        return _http_json("POST", self.server + "/api/companion/aram/augments", self.headers, body=payload, timeout=8) or {}
+
+    def get_aram_tiers(self) -> dict:
+        return _http_json("GET", self.server + "/api/companion/aram/tiers", self.headers, timeout=15) or {}
+
+    def get_aram_champion(self, champion_id: int) -> dict:
+        return _http_json("GET", self.server + f"/api/companion/aram/champion?id={int(champion_id)}", self.headers, timeout=15) or {}
+
+    def post_aram_guide(self, payload: dict) -> dict:
+        # AI 写攻略要几秒到十几秒；读条有三四十秒，等得起
+        return _http_json("POST", self.server + "/api/companion/aram/guide", self.headers, body=payload, timeout=25) or {}
 
     def post_blacklist_import(self, payload: dict) -> dict:
         # 一批最多 25 条，机器人那边每条要查一次 Riot（1.3 秒），所以超时给足
@@ -563,6 +619,7 @@ class Companion:
         self.post_game_deadline = 0.0
         self.next_history_check = 0.0
         self.last_lcu_warn = 0.0
+        self.phase_errors = 0                      # 连着几次问客户端阶段都超时
         self.send_latest_once = bool(args.send_latest)
         self.last_reauth_prompt = 0.0
         self.account_issue = ""                    # 当前登录的号有问题（没绑定 / 令牌是别人的）：窗口上红字提示
@@ -1132,7 +1189,16 @@ class Companion:
                     continue
             try:
                 phase = self.lcu.gameflow_phase()
+                self.phase_errors = 0
             except Exception as e:
+                # 客户端只是答得慢（读条、刚进游戏时常见）不算断开：连着三次都超时才算。
+                # 以前一次超时就断开重连，重连后要重新走一遍开局通知，海克斯助手这期间也跟着停摆
+                self.phase_errors += 1
+                if "timed out" in str(e).lower() and self.phase_errors < 3:
+                    logger.debug(f"客户端答得慢（第 {self.phase_errors} 次超时），先不当成断开")
+                    time.sleep(2)
+                    continue
+                self.phase_errors = 0
                 self.disconnect_lcu(f"{e}")
                 time.sleep(5)
                 continue
@@ -1630,6 +1696,911 @@ class AutoAccepter:
         return True
 
 
+# ----------------------------------------------------------------------------
+# 海克斯助手（v1.8.0）：海克斯大乱斗三选一出来时（自动发现，或者按热键），截下三张卡的标题发给机器人认，
+# 机器人回每张卡的梯队和排名，窗口那边把它标在卡片上方（AramOverlay）。
+# 找游戏窗口、标题位置的比例参考了 Nyx0ra/lol-aram-mayhem-hextech-helper（MIT）的 window_layout.py
+# ----------------------------------------------------------------------------
+ARAM_MODES = {"KIWI", "KIWI_JADE"}          # 海克斯大乱斗的模式名
+ARAM_QUEUES = {2400}
+ARAM_HOTKEY_DEFAULT = "F6"
+ARAM_HOTKEYS = {f"F{n}": 0x6F + n for n in range(1, 13)}        # 配置文件里 aram_hotkey 可以改成 F1–F12
+# 三张卡的中线 ÷ 画面宽（按 16:9 的画面算）。标题在卡片里的高低，不同版本 / 分辨率下差着 1% 屏高左右
+# （hextech-helper 的截图里标题中心在 40.0% 屏高，Riot 客户端 16.22 实测在 41.1%），
+# 所以不截固定的一窄条，而是截高一点的一条（37.2%–45.8%），在里面自己找标题那一行
+ARAM_CARD_CENTERS = (0.3115, 0.5, 0.6885)
+ARAM_BAND_TOP, ARAM_BAND_W, ARAM_BAND_H = 0.372, 0.135, 0.086
+ARAM_COOLDOWN = 0.7                         # 两次手动识别最少隔这么久（按住不放、连按）
+ARAM_SCAN_SECONDS = 0.35                    # 自动识别：对局中每隔这么久看一眼三张卡标题的位置
+ARAM_RECHECK_SECONDS = 1.5                  # 两次上传最少隔这么久（重掷、鼠标悬停都会让画面变）
+_ARAM_WIN = None
+
+
+def _aram_win():
+    """这一节用到的 Windows 接口。单独开一份 user32 / gdi32 并声明参数类型：
+    64 位系统上窗口句柄不声明会被截成 32 位；也不影响文件里其它地方对 ctypes.windll 的调用"""
+    global _ARAM_WIN
+    if _ARAM_WIN is None:
+        import ctypes
+        from ctypes import wintypes
+        import types
+        u, g = ctypes.WinDLL("user32", use_last_error=True), ctypes.WinDLL("gdi32", use_last_error=True)
+
+        def bind(dll, name, res, *args):
+            fn = getattr(dll, name)
+            fn.restype, fn.argtypes = res, list(args)
+            return fn
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG), ("biHeight", wintypes.LONG),
+                        ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                        ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                        ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                        ("biClrImportant", wintypes.DWORD)]
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT),
+                        ("dwFlags", wintypes.DWORD)]
+        ENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        H, B, I, U = wintypes.HWND, wintypes.BOOL, ctypes.c_int, wintypes.UINT
+        HDC = wintypes.HDC
+        _ARAM_WIN = types.SimpleNamespace(
+            ctypes=ctypes, wintypes=wintypes, BITMAPINFOHEADER=BITMAPINFOHEADER,
+            FindWindowW=bind(u, "FindWindowW", H, wintypes.LPCWSTR, wintypes.LPCWSTR),
+            GetForegroundWindow=bind(u, "GetForegroundWindow", H),
+            GetAsyncKeyState=bind(u, "GetAsyncKeyState", ctypes.c_short, I),
+            IsIconic=bind(u, "IsIconic", B, H), IsWindowVisible=bind(u, "IsWindowVisible", B, H),
+            GetClientRect=bind(u, "GetClientRect", B, H, ctypes.POINTER(wintypes.RECT)),
+            ClientToScreen=bind(u, "ClientToScreen", B, H, ctypes.POINTER(wintypes.POINT)),
+            GetDC=bind(u, "GetDC", HDC, H), ReleaseDC=bind(u, "ReleaseDC", I, H, HDC),
+            RegisterHotKey=bind(u, "RegisterHotKey", B, H, I, U, U),
+            UnregisterHotKey=bind(u, "UnregisterHotKey", B, H, I),
+            PeekMessageW=bind(u, "PeekMessageW", B, ctypes.POINTER(wintypes.MSG), H, U, U, U),
+            GetAncestor=bind(u, "GetAncestor", H, H, U),
+            GetWindowRect=bind(u, "GetWindowRect", B, H, ctypes.POINTER(wintypes.RECT)),
+            GetClassNameW=bind(u, "GetClassNameW", I, H, wintypes.LPWSTR, I),
+            ENUMPROC=ENUMPROC, EnumWindows=bind(u, "EnumWindows", B, ENUMPROC, wintypes.LPARAM),
+            MonitorFromRect=bind(u, "MonitorFromRect", wintypes.HANDLE, ctypes.POINTER(wintypes.RECT), wintypes.DWORD),
+            GetMonitorInfoW=bind(u, "GetMonitorInfoW", B, wintypes.HANDLE, ctypes.c_void_p), MONITORINFO=MONITORINFO,
+            GetWindowLongW=bind(u, "GetWindowLongW", wintypes.LONG, H, I),
+            SetWindowLongW=bind(u, "SetWindowLongW", wintypes.LONG, H, I, wintypes.LONG),
+            SetWindowPos=bind(u, "SetWindowPos", B, H, H, I, I, I, I, U),
+            CreateCompatibleDC=bind(g, "CreateCompatibleDC", HDC, HDC),
+            CreateCompatibleBitmap=bind(g, "CreateCompatibleBitmap", wintypes.HBITMAP, HDC, I, I),
+            SelectObject=bind(g, "SelectObject", wintypes.HGDIOBJ, HDC, wintypes.HGDIOBJ),
+            BitBlt=bind(g, "BitBlt", B, HDC, I, I, I, I, HDC, I, I, wintypes.DWORD),
+            GetDIBits=bind(g, "GetDIBits", I, HDC, wintypes.HBITMAP, U, U, ctypes.c_void_p, ctypes.c_void_p, U),
+            DeleteObject=bind(g, "DeleteObject", B, wintypes.HGDIOBJ), DeleteDC=bind(g, "DeleteDC", B, HDC))
+    return _ARAM_WIN
+
+
+def find_game_window() -> int:
+    """对局的游戏窗口（不是大厅）。没在对局里就是 0"""
+    return int(_aram_win().FindWindowW("RiotWindowClass", "League of Legends (TM) Client") or 0)
+
+
+def game_layout() -> dict | None:
+    """游戏窗口在最前面时，返回它画面在屏幕上的位置：
+    {"hwnd", "client": (左, 上, 宽, 高), "content": 同样四个数，超宽屏上是中间那块 16:9}。
+    不在最前面、最小化了、没开游戏都返回 None——这时既截不到卡片，标注也没地方放"""
+    w = _aram_win()
+    hwnd = find_game_window()
+    if not hwnd or hwnd != int(w.GetForegroundWindow() or 0) or w.IsIconic(hwnd) or not w.IsWindowVisible(hwnd):
+        return None
+    rect = w.wintypes.RECT()
+    if not w.GetClientRect(hwnd, w.ctypes.byref(rect)):
+        return None
+    a, b = w.wintypes.POINT(rect.left, rect.top), w.wintypes.POINT(rect.right, rect.bottom)
+    if not (w.ClientToScreen(hwnd, w.ctypes.byref(a)) and w.ClientToScreen(hwnd, w.ctypes.byref(b))):
+        return None
+    width, height = b.x - a.x, b.y - a.y
+    if width < 320 or height < 200:
+        return None
+    cw = min(width, round(height * 16 / 9))
+    return {"hwnd": hwnd, "client": (a.x, a.y, width, height), "content": (a.x + (width - cw) // 2, a.y, cw, height)}
+
+
+def aram_band_rect(layout: dict, slot: int) -> tuple[int, int, int, int]:
+    """第 slot 张卡（0–2）标题所在的那一条在屏幕上的位置 (左, 上, 宽, 高)。比标题本身高，里面还会有标题下面的小标签"""
+    left, top, cw, ch = layout["content"]
+    width = max(8, int(cw * ARAM_BAND_W))
+    return (left + int(cw * ARAM_CARD_CENTERS[slot]) - width // 2, top + int(ch * ARAM_BAND_TOP),
+            width, max(8, int(ch * ARAM_BAND_H)))
+
+
+def aram_find_title(bgra: bytes, width: int, height: int) -> tuple[int, int] | None:
+    """在一条截图里找标题那一行，返回 (上, 下) 两个行号；找不到返回 None。
+    卡片里从上到下是：标题（大字）、一排小标签（「伤害」「功能」）、说明文字。标题是这一条里最靠上的、够高的一行亮字"""
+    gray = bgra[1::4]
+    step = max(1, width // 160)
+    rows = [gray[y * width:(y + 1) * width:step] for y in range(height)]
+    sample = b"".join(rows[::max(1, height // 40)])
+    order = sorted(sample)
+    bg, hi = order[len(order) // 2], order[len(order) - 1 - len(order) // 200]
+    if hi - bg < 60 or bg > 80:
+        return None
+    table = bytes(1 if v > bg + (hi - bg) * 0.55 else 0 for v in range(256))
+    masks = [r.translate(table) for r in rows]
+    sw = len(masks[0])
+    # 这一条的两边可能带进卡片的亮边框：从上到下一直亮着的那些列不是字，先去掉（不然每一行都「有亮点」）
+    column = [sum(m[x] for m in masks) for x in range(sw)]
+    keep = bytes(0 if column[x] > height * 0.6 else 1 for x in range(sw))
+    need = max(2, sw // 60)
+    on = [sum(a & b for a, b in zip(m, keep)) >= need for m in masks]
+    runs, start = [], None
+    for y in range(height + 1):
+        lit = y < height and on[y]
+        if lit and start is None:
+            start = y
+        elif not lit and start is not None:
+            if runs and start - runs[-1][1] <= max(1, height // 45):      # 一个字上下两半之间断了一两行：算同一行
+                runs[-1][1] = y
+            else:
+                runs.append([start, y])
+            start = None
+    for top, bottom in runs:
+        if height * 0.13 <= bottom - top <= height * 0.45:               # 标题字高约占这一条的四分之一；小标签更矮
+            return top, bottom
+    return None
+
+
+def aram_title_shot(layout: dict, slot: int) -> tuple[tuple, bool, tuple]:
+    """截第 slot 张卡的标题：返回 ((像素, 宽, 高), 像不像卡片标题, 指纹)。
+    找到标题行就只留那一行（上下各留一点边），发给机器人的也只是这一行；找不到就整条算作「不像」"""
+    left, top, width, height = aram_band_rect(layout, slot)
+    raw = grab_screen(left, top, width, height)
+    found = aram_find_title(raw, width, height)
+    if found is None:
+        looks, sig = aram_fingerprint(raw, width, height)
+        return (raw, width, height), False, sig
+    pad = max(2, int((found[1] - found[0]) * 0.4))
+    y0, y1 = max(0, found[0] - pad), min(height, found[1] + pad)
+    crop = raw[y0 * width * 4:y1 * width * 4]
+    looks, sig = aram_fingerprint(crop, width, y1 - y0)
+    return (crop, width, y1 - y0), looks, sig
+
+
+def grab_screen(left: int, top: int, width: int, height: int) -> bytes:
+    """截屏幕上一块，返回 BGRA 像素（从上到下）。只用系统自带的 GDI，游戏要是无边框 / 窗口模式才截得到"""
+    w = _aram_win()
+    screen = w.GetDC(None)
+    mem = w.CreateCompatibleDC(screen)
+    bmp = w.CreateCompatibleBitmap(screen, width, height)
+    old = w.SelectObject(mem, bmp)
+    try:
+        if not w.BitBlt(mem, 0, 0, width, height, screen, left, top, 0x00CC0020 | 0x40000000):   # SRCCOPY | CAPTUREBLT
+            raise OSError("截屏失败")
+        w.SelectObject(mem, old)                 # GetDIBits 要求位图没被选进任何 DC
+        hdr = w.BITMAPINFOHEADER(w.ctypes.sizeof(w.BITMAPINFOHEADER), width, -height, 1, 32, 0, 0, 0, 0, 0, 0)
+        buf = w.ctypes.create_string_buffer(width * height * 4)
+        if w.GetDIBits(mem, bmp, 0, height, buf, w.ctypes.byref(hdr), 0) != height:
+            raise OSError("读取截屏失败")
+        return buf.raw
+    finally:
+        w.SelectObject(mem, old)
+        w.DeleteObject(bmp)
+        w.DeleteDC(mem)
+        w.ReleaseDC(None, screen)
+
+
+def png_gray(bgra: bytes, width: int, height: int) -> bytes:
+    """BGRA 像素 -> 灰度 PNG（只取绿色通道，认字够用，一条标题才几 KB）"""
+    import struct
+    import zlib
+    gray = bgra[1::4]
+    rows = b"".join(b"\x00" + gray[y * width:(y + 1) * width] for y in range(height))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows, 6)) + chunk(b"IEND", b""))
+
+
+def aram_fingerprint(bgra: bytes, width: int, height: int) -> tuple[bool, tuple]:
+    """一条标题截图的「指纹」：(看着像不像卡片标题, (亮点图, 亮点个数))。
+    卡片标题的样子很固定：一大片很暗的卡片底色，正中间一行亮的字。只用来在本机便宜地判断
+    「三选一是不是出来了 / 字换没换」，真正认字还是交给机器人。纯 Python，一条不到 1 毫秒"""
+    gray = bgra[1::4]
+    step = max(1, width // 120)                      # 缩到宽 120 左右再算
+    rows = [gray[y * width:(y + 1) * width:step] for y in range(0, height, step)]
+    small = b"".join(rows)
+    n, sw, sh = len(small), len(rows[0]), len(rows)
+    if n < 64:
+        return False, (b"", 0)
+    order = sorted(small)
+    bg, hi = order[n // 2], order[n - 1 - n // 100]  # 底色（中位数）、字的亮度（最亮的 1%）
+    thr = bg + (hi - bg) * 0.5
+    mask = small.translate(bytes(1 if v > thr else 0 for v in range(256)))      # 每个点：比阈值亮是 1
+    total = sum(mask)
+    near_bg = sum(small.translate(bytes(1 if abs(v - bg) <= 22 else 0 for v in range(256)))) / n
+    looks = hi - bg >= 60 and bg <= 80 and 0.012 <= total / n <= 0.42 and near_bg >= 0.5
+    if looks:
+        # 标题是居中的一行字：亮点的重心在正中间，最上最下各 1/8 的行基本没有亮点。
+        # 地形、技能特效这些亮点位置是随机的。用真实截图校准：标题 12/12 通过，游戏画面别处的误判从 29% 降到 1% 左右
+        col_sums = [sum(mask[x::sw]) for x in range(sw)]
+        row_sums = [sum(mask[y * sw:(y + 1) * sw]) for y in range(sh)]
+        cx = sum(i * c for i, c in enumerate(col_sums)) / total / max(1, sw - 1)
+        cy = sum(i * c for i, c in enumerate(row_sums)) / total / max(1, sh - 1)
+        k = max(1, sh // 8)
+        margin = (sum(row_sums[:k]) + sum(row_sums[-k:])) / total
+        looks = 0.38 <= cx <= 0.62 and 0.3 <= cy <= 0.7 and margin <= 0.12
+    return looks, (mask, total)
+
+
+def aram_same(a, b) -> bool:
+    """两次截的三条标题是不是同样的字：每一条亮点位置不一样的地方都不到亮点数的四分之一。
+    故意比得细：重掷只换一张卡、新旧名字长短差不多时也要看得出来；宁可多重认一次，也不能留着旧的标注"""
+    if a is None or b is None or len(a) != len(b):
+        return False
+    for (mask_a, n_a), (mask_b, n_b) in zip(a, b):
+        if len(mask_a) != len(mask_b):
+            return False
+        diff = bin(int.from_bytes(mask_a, "big") ^ int.from_bytes(mask_b, "big")).count("1")
+        if diff > 0.25 * max(1.0, (n_a + n_b) / 2):
+            return False
+    return True
+
+
+ARAM_PANEL_HIDE_AT = 40         # 游戏内时间到了这么多秒，攻略侧栏收起（读条可能只有十来秒，AI 还没写完，进了游戏接着看）
+ARAM_PEEK_VK = 0x09             # 收起以后按住这个键（Tab，也就是游戏里看计分板的键）再看一眼攻略侧栏
+# 海克斯助手下面的细项开关：(配置文件里的键, 窗口上的字)。都默认开；总开关关掉时全部不工作
+ARAM_OPTIONS = (("aram_auto", "海克斯选择推荐"),
+                ("aram_panel", "选人和读条时的攻略侧栏"),
+                ("aram_ai_guide", "AI 开局攻略"))
+# 全屏时自动改成无边框不放进细项：默认就开着，只能在配置文件里用 "aram_borderless": false 关
+ARAM_PLAYER_GAMES = 20          # 十人战绩：每人看最近这么多局
+ARAM_PREMADE_SHARED = 3         # 两个人最近的对局里有这么多局是同一局，就算一起开黑的
+ARAM_BOSS_MIN_GAMES, ARAM_BOSS_MIN_WIN = 8, 0.55
+
+
+def live_clock(lcu) -> float | None:
+    """游戏里已经过了多少秒（游戏进程自己的接口，端口 2999）。读条时游戏还没开，问不到，返回 None"""
+    try:
+        data = _http_json("GET", "https://127.0.0.1:2999/liveclientdata/gamestats", {}, timeout=1.5,
+                          ssl_context=getattr(lcu, "ctx", None))
+        seconds = (data or {}).get("gameTime")
+        return float(seconds) if isinstance(seconds, (int, float)) else None
+    except Exception:
+        return None
+
+
+def parse_champ_select(session: dict) -> dict:
+    """选人界面的状态：我现在拿的英雄、候选席上有哪些英雄"""
+    session = session if isinstance(session, dict) else {}
+    local, mine = session.get("localPlayerCellId"), 0
+    for m in session.get("myTeam") or []:
+        if isinstance(m, dict) and m.get("cellId") == local:
+            cid = m.get("championId") or m.get("championPickIntent") or 0
+            mine = cid if isinstance(cid, int) else 0
+    bench = [b.get("championId") for b in session.get("benchChampions") or []
+             if isinstance(b, dict) and isinstance(b.get("championId"), int) and b.get("championId") > 0]
+    return {"champion_id": mine, "bench": bench}
+
+
+def summarize_player(games: list, puuid: str, skip_game_id=None) -> dict:
+    """一个人最近的对局 -> 局数、胜率、KDA、每分钟伤害，外加对局编号（用来看谁和谁一起打过）"""
+    n = wins = kills = deaths = assists = damage = seconds = 0
+    ids = set()
+    for g in games or []:
+        if not isinstance(g, dict) or g.get("gameId") == skip_game_id:
+            continue
+        parts = g.get("participants") or []
+        idents = g.get("participantIdentities") or []
+        pid = next((i.get("participantId") for i in idents if ((i.get("player") or {}).get("puuid")) == puuid), None)
+        part = next((x for x in parts if x.get("participantId") == pid), parts[0] if parts else None)
+        if not part:
+            continue
+        st = part.get("stats") or {}
+        n += 1
+        wins += 1 if st.get("win") else 0
+        kills += int(st.get("kills") or 0)
+        deaths += int(st.get("deaths") or 0)
+        assists += int(st.get("assists") or 0)
+        damage += int(st.get("totalDamageDealtToChampions") or 0)
+        seconds += int(g.get("gameDuration") or 0)
+        if g.get("gameId"):
+            ids.add(g["gameId"])
+        if n >= ARAM_PLAYER_GAMES:
+            break
+    return {"games": n, "wins": wins, "win_rate": round(wins / n, 3) if n else None,
+            "kda": round((kills + assists) / max(1, deaths), 1) if n else None,
+            "dpm": round(damage / (seconds / 60)) if seconds > 0 else None, "game_ids": ids}
+
+
+def collect_player_stats(lcu, teams: list, game_id=None) -> list:
+    """双方十个人的近期战绩，顺序和客户端给的一样（读条界面的卡片也是这个顺序）。
+    每人一行：{"team", "slot", "is_me", "champion_id", "games", "win_rate", "kda", "premade", "boss"}。
+    premade = 和他一起开黑的一共几个人（0 = 单排）；boss = 这一队里近期打得最凶的那个（「大哥」）。
+    只读客户端的战绩接口，和点开别人的战绩页是同一个接口"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def fetch(p: dict) -> dict:
+        stats = {"games": 0, "wins": 0, "win_rate": None, "kda": None, "dpm": None, "game_ids": set()}
+        if p.get("puuid"):
+            try:
+                stats = summarize_player(lcu.match_history(p["puuid"], ARAM_PLAYER_GAMES), p["puuid"], game_id)
+            except Exception as e:
+                logger.debug(f"十人战绩：查 {p['puuid'][:8]} 失败: {e}")
+        return {"team": p["team"], "is_me": bool(p.get("is_me")), "champion_id": p.get("champion_id") or 0, **stats}
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        rows = list(pool.map(fetch, teams))
+    for team in (1, 2):
+        mates = [r for r in rows if r["team"] == team]
+        for slot, r in enumerate(mates):
+            r["slot"] = slot
+        # 开黑：一起打过够多局的连成一组（甲和乙、乙和丙一起打过，三个人就是一组）
+        group = list(range(len(mates)))
+        for i in range(len(mates)):
+            for j in range(i + 1, len(mates)):
+                if len(mates[i]["game_ids"] & mates[j]["game_ids"]) >= ARAM_PREMADE_SHARED:
+                    old, new = group[j], group[i]
+                    group = [new if x == old else x for x in group]
+        for i, r in enumerate(mates):
+            size = group.count(group[i])
+            r["premade"] = size if size >= 2 else 0
+        strong = [r for r in mates if r["games"] >= ARAM_BOSS_MIN_GAMES and (r["win_rate"] or 0) >= ARAM_BOSS_MIN_WIN and r["dpm"]]
+        boss = max(strong, key=lambda r: r["dpm"], default=None)
+        for r in mates:
+            r["boss"] = r is boss
+    for r in rows:
+        r.pop("game_ids", None)
+    return rows
+
+
+class AramAssistant:
+    """海克斯助手的后台部分。只在海克斯大乱斗对局里工作：
+    - 自动：每 0.35 秒截一下三张卡标题的位置，在本机判断像不像卡片标题；连着两次都像、画面也稳住了，
+      才把这三小条发给机器人认。认出来就显示，之后一直盯着：换了卡（重掷）就重认，卡片没了就收掉
+    - 手动：热键（默认 F6）立刻认一次，自动没认出来时用
+    结果放进 events 交给窗口线程去画。不读游戏内存，不向游戏发任何按键"""
+
+    def __init__(self, config: dict, companion, bot):
+        import queue
+        self.config, self.companion, self.bot = config, companion, bot
+        self.events = queue.Queue()        # ("busy", layout) / ("cards", layout, [卡片]) / ("msg", layout, 文字) / ("clear",)
+        self.info: dict = {}               # 这一局：game_id、模式、队列、我的英雄
+        self.info_retry_at = 0.0
+        self.registered_vk = 0
+        self.register_failed = ""          # 热键被别的程序占了：只提示一次
+        self.last_press = 0.0
+        self.busy = False
+        self.next_scan = 0.0
+        self.prev_bits = None              # 上一次扫到的指纹：和这次差不多才算「画面稳住了」
+        self.shown_bits = None             # 正显示着的那组卡的指纹；None = 现在没在显示
+        self.miss = 0                      # 显示着的时候连着几次不像卡片了
+        self.neg_bits = None               # 发上去机器人说不是卡片的那个画面：一样的画面不再发
+        self.neg_until = 0.0
+        self.neg_streak = 0                # 连着几次白发：越多，下次发得越晚
+        self.next_upload = 0.0
+        self.same_streak = 0               # 重认了几次结果都没变（鼠标悬停让画面一直在动）：越多，下次重认越晚
+        self.auto_off_until = 0.0          # 机器人不支持 / 限流时，自动识别先歇一会儿
+        self.last_names: tuple = ()
+        self.next_borderless = 0.0         # 下次检查游戏是不是全屏
+        self.borderless_warned = False
+        self.select_state = None           # 选人界面：我的英雄 + 候选席（变了才通知窗口）
+        self.select_mayhem = None          # 这次选人是不是海克斯大乱斗（None = 还没问）
+        self.next_select = 0.0
+        self.prepared_game = None          # 已经为哪一局准备过读条数据（十人战绩、攻略）
+        self._icons: dict = {}             # 英雄编号 -> 头像图的原始内容（从本机客户端读的，一次开机每个英雄只读一回）
+        self._icons_busy: set = set()      # 正在读的
+        self._icons_retry: dict = {}       # 没读到的：英雄编号 -> 什么时候可以再试
+        self._icons_lock = threading.Lock()
+        self.guide_off_until = 0.0
+        self.started_game = None           # 哪一局已经确认开打了
+        self.next_clock = 0.0
+        self._tiers: dict = {}
+        self._tiers_at = self._tiers_retry = 0.0
+        self._cards: dict = {}             # 英雄 id -> (时刻, 攻略卡)
+        threading.Thread(target=self._loop, daemon=True, name="aram-hotkey").start()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.config.get("aram_helper", True))
+
+    def set_enabled(self, on: bool) -> None:
+        self.config["aram_helper"] = bool(on)
+        save_config(self.config)
+        logger.info("海克斯助手：已开启（海克斯大乱斗里三选一时自动标出推荐）" if on else "海克斯助手：已关闭")
+
+    def option(self, key: str) -> bool:
+        """细项开关：没写过就是开"""
+        return self.config.get(key, True) is not False
+
+    def set_option(self, key: str, on: bool) -> None:
+        self.config[key] = bool(on)
+        save_config(self.config)
+        label = dict(ARAM_OPTIONS).get(key, key)
+        logger.info(f"海克斯助手：「{label}」已{'开启' if on else '关闭'}")
+
+    @property
+    def hotkey_name(self) -> str:
+        name = str(self.config.get("aram_hotkey") or ARAM_HOTKEY_DEFAULT).upper()
+        return name if name in ARAM_HOTKEYS else ARAM_HOTKEY_DEFAULT
+
+    # --- 这一局是不是海克斯大乱斗、我用的什么英雄 ---
+    def game_info(self) -> dict | None:
+        c = self.companion
+        game_id, lcu = c.current_game_id, c.lcu
+        if not game_id or lcu is None:        # current_game_id 一进对局就有、对局结束 / 断开就清掉，不用再看阶段：
+            return None                       # 阶段要等主循环发完开局通知才更新，那可能要好几秒
+        if self.info.get("game_id") == game_id and (self.info.get("champion_id") or time.time() < self.info_retry_at):
+            return self.info
+        self.info_retry_at = time.time() + 5          # 没读到（客户端忙）就 5 秒后再读，别每轮都问
+        info = {"game_id": game_id, "game_mode": "", "queue_id": None, "champion_id": 0, "teams": []}
+        try:
+            data = (lcu.get("/lol-gameflow/v1/session", timeout=4) or {}).get("gameData") or {}
+            queue = data.get("queue") or {}
+            info["game_mode"] = str(queue.get("gameMode") or "").upper()
+            info["queue_id"] = queue.get("id") if isinstance(queue.get("id"), int) else None
+            puuid = c.summoner.get("puuid")
+            members = []
+            for team_no, team in enumerate((data.get("teamOne") or [], data.get("teamTwo") or []), 1):
+                for t in team:
+                    if isinstance(t, dict):
+                        cid = t.get("championId") if isinstance(t.get("championId"), int) else 0
+                        members.append({"puuid": str(t.get("puuid") or ""), "champion_id": cid, "team": team_no,
+                                        "is_me": bool(puuid) and t.get("puuid") == puuid})
+            # 读条界面上卡片的左右顺序不是 teamOne / teamTwo 的顺序，而是 playerChampionSelections 的顺序
+            # （实测一局：这份名单和读条界面、和战绩里的参赛者编号完全一致）。上排是 teamOne，下排是 teamTwo
+            by_puuid = {mb["puuid"]: mb for mb in members if mb["puuid"]}
+            picks = [x.get("puuid") for x in data.get("playerChampionSelections") or [] if isinstance(x, dict)]
+            if len(by_puuid) == len(members) and sorted(picks) == sorted(by_puuid):
+                members = [by_puuid[x] for x in picks]
+            info["teams"] = sorted(members, key=lambda mb: mb["team"])        # 稳定排序：队内顺序保持上面排好的
+            info["champion_id"] = next((mb["champion_id"] for mb in members if mb["is_me"] and mb["champion_id"]), 0)
+        except Exception as e:
+            logger.debug(f"海克斯助手：读对局信息失败: {e}")
+        if info["game_mode"] or info["champion_id"] or self.info.get("game_id") != game_id:
+            fresh = self.info.get("game_id") != game_id
+            self.info = info
+            if fresh and self.enabled and self.is_mayhem(info):
+                logger.info(f"海克斯助手：这局是海克斯大乱斗，三选一时会自动标出推荐（游戏要用无边框模式；"
+                            f"没出来可以按 {self.hotkey_name}）")
+            elif fresh and self.enabled and (info["game_mode"] or info["queue_id"] is not None):
+                # 说清楚为什么这局没动静（自定义对局报上来的模式名可能和匹配的不一样，看这行就知道）
+                logger.info(f"海克斯助手：这局的模式是 {info['game_mode'] or '（空）'}、队列 {info['queue_id']}，"
+                            f"不是海克斯大乱斗，这局不启用")
+        return self.info
+
+    @staticmethod
+    def is_mayhem(info: dict | None) -> bool:
+        return bool(info) and (info.get("game_mode") in ARAM_MODES or info.get("queue_id") in ARAM_QUEUES)
+
+    # --- 主循环：管热键（注册和等消息必须在同一个线程），顺带定时自动扫描 ---
+    def _loop(self) -> None:
+        w = _aram_win()
+        msg = w.wintypes.MSG()
+        while True:
+            want = 0
+            try:
+                want = ARAM_HOTKEYS[self.hotkey_name] if self.enabled and self.is_mayhem(self.game_info()) else 0
+                if want != self.registered_vk and not (want and self.register_failed == self.hotkey_name):
+                    if self.registered_vk:
+                        w.UnregisterHotKey(None, 1)
+                        self.registered_vk = 0
+                    if want:
+                        if w.RegisterHotKey(None, 1, 0x4000, want):          # MOD_NOREPEAT：按住不放只算一次
+                            self.registered_vk = want
+                        else:
+                            self.register_failed = self.hotkey_name          # 这个键这次别再试了；自动识别不受影响
+                            logger.info(f"海克斯助手：{self.hotkey_name} 被别的程序占用了，手动识别用不了（自动的照常）。"
+                                        f"可以在 companion_config.json 里把 aram_hotkey 改成别的键（F1–F12）")
+                if not want:
+                    self.register_failed = ""
+                    if self.shown_bits is not None or self.prev_bits is not None:
+                        self._gone()                                         # 对局结束 / 关掉了开关：收掉标注
+                        self.prev_bits = None
+                while w.PeekMessageW(w.ctypes.byref(msg), None, 0, 0, 1):
+                    if msg.message == 0x0312 and msg.wParam == 1:            # WM_HOTKEY
+                        self.press()
+                if want and time.time() >= self.next_scan:
+                    self.next_scan = time.time() + ARAM_SCAN_SECONDS
+                    self._scan()
+                self._tick_extras()
+            except Exception as e:
+                logger.debug(f"海克斯助手：{e}")
+            time.sleep(0.05 if want else 0.5)
+
+    # ------------------------------------------------------------------------
+    # 选人梯队、英雄攻略、AI 开局攻略、十人战绩、无边框检查：都是「准备数据 → 放进 events 给窗口线程显示」
+    # ------------------------------------------------------------------------
+    def _tick_extras(self) -> None:
+        """主循环每圈调用一次，里面各自按自己的节奏干活"""
+        c = self.companion
+        lcu, phase, now = c.lcu, c.last_phase, time.time()
+        if lcu is None:
+            if self.select_state is not None or self.prepared_game is not None:
+                self.select_state, self.prepared_game, self.select_mayhem = None, None, None
+                self.events.put(("select", None))
+                self.events.put(("pregame", None))
+            return
+        # 十人战绩不分模式、有自己的开关；其余几样（无边框、选人梯队、攻略）都算海克斯助手的一部分
+        if self.enabled and now >= self.next_borderless and phase not in IN_GAME_PHASES:
+            self.next_borderless = now + 60
+            threading.Thread(target=self.ensure_borderless, args=(lcu,), daemon=True, name="aram-borderless").start()
+        if phase == "ChampSelect" and not c.current_game_id and self.enabled and self.option("aram_panel"):
+            if now >= self.next_select:
+                self.next_select = now + 1.0
+                self._poll_select(lcu)
+        elif self.select_state is not None or self.select_mayhem is not None:
+            self.select_state, self.select_mayhem = None, None
+            self.events.put(("select", None))
+        info = self.game_info()
+        if info and info.get("teams") and info.get("game_id") != self.prepared_game:
+            self.prepared_game = info["game_id"]
+            threading.Thread(target=self._prepare_game, args=(lcu, dict(info)), daemon=True, name="aram-pregame").start()
+        elif not info and self.prepared_game is not None:
+            self.prepared_game = None
+            self.events.put(("pregame", None))
+
+    # --- 无边框 ---
+    def ensure_borderless(self, lcu) -> str:
+        """海克斯标注盖不到独占全屏的游戏上，截图也截不到：发现游戏设成了全屏，就通过客户端把它改成无边框
+        （下一局生效）。窗口模式不动。配置文件里 "aram_borderless": false 可以关掉这个检查。
+        返回做了什么（给日志和测试看）：off / unknown / ok / changed / failed"""
+        if not self.option("aram_borderless"):
+            return "off"
+        try:
+            settings = lcu.get("/lol-game-settings/v1/game-settings", timeout=5) or {}
+            general = settings.get("General") if isinstance(settings, dict) else None
+            mode = general.get("WindowMode") if isinstance(general, dict) else None
+            if not isinstance(mode, int) or isinstance(mode, bool):
+                logger.debug("海克斯助手：没读到游戏的显示模式，不动它")
+                return "unknown"                  # 客户端返回的结构和预期不一样：宁可不改
+            if mode != 0:                         # 0 全屏 / 1 窗口 / 2 无边框
+                return "ok"
+            lcu.patch("/lol-game-settings/v1/game-settings", {"General": {"WindowMode": 2}}, timeout=5)
+            try:
+                lcu.post("/lol-game-settings/v1/save", timeout=5)
+            except Exception as e:
+                logger.debug(f"海克斯助手：保存游戏设置时出错: {e}")
+            after = ((lcu.get("/lol-game-settings/v1/game-settings", timeout=5) or {}).get("General") or {}).get("WindowMode")
+            if after == 2:
+                logger.info("海克斯助手：游戏原来是全屏模式，已经改成无边框（下一局生效）。全屏下标注盖不上去。"
+                            "不想让插件改：在 companion_config.json 里加一行 \"aram_borderless\": false")
+                return "changed"
+            if not self.borderless_warned:
+                self.borderless_warned = True
+                logger.warning("海克斯助手：游戏是全屏模式，自动改成无边框没成功。请在游戏里按 Esc → 视频 → 窗口模式选「无边框」，"
+                               "不然海克斯标注显示不出来")
+            return "failed"
+        except Exception as e:
+            logger.debug(f"海克斯助手：检查显示模式失败: {e}")
+            return "failed"
+
+    # --- 机器人那边的数据（梯队表、英雄攻略卡），取一次存着 ---
+    def tiers(self) -> dict:
+        """全英雄梯队 {英雄 id（字符串）: {"tier", "rank", "win_rate"}}；拿不到返回空表，10 分钟后再试"""
+        now = time.time()
+        if self._tiers and now - self._tiers_at < 6 * 3600:
+            return self._tiers
+        if now < self._tiers_retry:
+            return self._tiers
+        self._tiers_retry = now + 600
+        try:
+            resp = self.bot.get_aram_tiers()
+            if isinstance(resp.get("champions"), dict) and resp["champions"]:
+                self._tiers, self._tiers_at = resp["champions"], now
+        except Exception as e:
+            logger.debug(f"海克斯助手：梯队表没拿到: {e}")
+        return self._tiers
+
+    def champion_card(self, champion_id: int) -> dict | None:
+        """一个英雄的攻略卡（技能加点、召唤师技能、出装、最强的海克斯）。每个英雄每小时最多问一次机器人"""
+        hit = self._cards.get(champion_id)
+        if hit and time.time() - hit[0] < 3600:
+            return hit[1]
+        try:
+            card = self.bot.get_aram_champion(champion_id)
+        except Exception as e:
+            logger.debug(f"海克斯助手：英雄 {champion_id} 的攻略没拿到: {e}")
+            card = None
+        if not (isinstance(card, dict) and card.get("ok")):
+            card = None
+        self._cards[champion_id] = (time.time() if card else time.time() - 3540, card)      # 没拿到的 1 分钟后可以再试
+        if len(self._cards) > 60:
+            self._cards.pop(next(iter(self._cards)))
+        return card
+
+    # --- 选人阶段：我现在的英雄和候选席上每个英雄的梯队 ---
+    def _poll_select(self, lcu) -> None:
+        try:
+            if self.select_mayhem is None:            # 这次选人是不是海克斯大乱斗：问一次就够
+                queue = ((lcu.get("/lol-gameflow/v1/session", timeout=3) or {}).get("gameData") or {}).get("queue") or {}
+                self.select_mayhem = self.is_mayhem({"game_mode": str(queue.get("gameMode") or "").upper(),
+                                                     "queue_id": queue.get("id")})
+            if not self.select_mayhem:
+                return
+            session = lcu.get("/lol-champ-select/v1/session", timeout=3) or {}
+        except Exception as e:
+            logger.debug(f"海克斯助手：读选人信息失败: {e}")
+            return
+        state = parse_champ_select(session)
+        if state == self.select_state:
+            return
+        changed_mine = (self.select_state or {}).get("champion_id") != state["champion_id"]
+        self.select_state = state
+        tiers = self.tiers()
+
+        def tag(cid: int) -> dict:
+            row = tiers.get(str(cid)) or {}
+            return {"champion_id": cid, "name": self.champion_name(cid), "tier": row.get("tier"), "rank": row.get("rank"),
+                    "win_rate": row.get("win_rate")}
+        view = {"mine": tag(state["champion_id"]) if state["champion_id"] else None,
+                "bench": sorted((tag(i) for i in state["bench"]), key=lambda t: t["rank"] if isinstance(t["rank"], (int, float)) else 999),
+                "card": None}
+        hit = self._cards.get(state["champion_id"])
+        if hit and hit[1]:
+            view["card"] = hit[1]
+        self.events.put(("select", view))
+        if state["champion_id"] and changed_mine and not view["card"]:
+            def work(cid=state["champion_id"], base=view):
+                card = self.champion_card(cid)
+                if card and (self.select_state or {}).get("champion_id") == cid:     # 这会儿没又换英雄
+                    self.events.put(("select", {**base, "card": card}))
+            threading.Thread(target=work, daemon=True, name="aram-card").start()
+
+    def icon_bytes(self, champion_id) -> bytes | None:
+        """这个英雄的头像图（PNG 原始内容）。还没读到就是 None，先调 want_icons 去读"""
+        return self._icons.get(champion_id)
+
+    def want_icons(self, champion_ids) -> None:
+        """后台去客户端读这些英雄的头像（客户端自带的图，不联网）。读到了发一个 ("icons",) 事件，侧栏把占位换成头像"""
+        now = time.time()
+        with self._icons_lock:
+            todo = [c for c in dict.fromkeys(champion_ids) if isinstance(c, int) and c > 0 and c not in self._icons
+                    and c not in self._icons_busy and now >= self._icons_retry.get(c, 0)]
+            self._icons_busy.update(todo)
+        if not todo:
+            return
+
+        def work():
+            got = False
+            for cid in todo:
+                try:
+                    lcu = getattr(self.companion, "lcu", None)
+                    raw = lcu.get_bytes(f"/lol-game-data/assets/v1/champion-icons/{cid}.png") if lcu else None
+                    if raw:
+                        self._icons[cid] = raw
+                        got = True
+                    else:
+                        self._icons_retry[cid] = time.time() + 20
+                except Exception as e:
+                    self._icons_retry[cid] = time.time() + 20
+                    logger.debug(f"英雄头像 {cid}：{e}")
+                finally:
+                    with self._icons_lock:
+                        self._icons_busy.discard(cid)
+            if got:
+                self.events.put(("icons",))
+        threading.Thread(target=work, daemon=True, name="aram-icons").start()
+
+    def champion_name(self, champion_id) -> str:
+        """英雄的名字：梯队表里带中文名；表还没拿到时用客户端给的英文代号"""
+        name = (self._tiers.get(str(champion_id)) or {}).get("name")
+        return name or (getattr(self.companion, "champions", None) or {}).get(str(champion_id), "")
+
+    # --- 进入对局（读条）：十人战绩，海克斯大乱斗再加攻略卡和 AI 攻略 ---
+    def _prepare_game(self, lcu, info: dict) -> None:
+        """进对局（读条开始）时准备数据。十人战绩、攻略卡 + AI 攻略各用一条线同时去取，谁先好谁先显示；
+        这条线自己留下来盯游戏里的时钟：一有时间了 = 读条结束（收掉读条界面上的战绩标签），
+        到 ARAM_PANEL_HIDE_AT 秒再收攻略侧栏"""
+        game_id, teams = info["game_id"], info.get("teams") or []
+        data = {"game_id": game_id, "mayhem": self.is_mayhem(info), "champion_id": info.get("champion_id"), "game_mode": info.get("game_mode") or ("KIWI" if self.is_mayhem(info) else ""),
+                "players": None, "card": None, "guide": None}
+
+        def publish():
+            if self.prepared_game == game_id:         # 这会儿还是这一局
+                self.events.put(("pregame", dict(data)))
+
+        def players():
+            try:
+                sizes = [sum(1 for p in teams if p["team"] == n) for n in (1, 2)]
+                if sizes == [5, 5] and self.config.get("player_stats", True) is not False:
+                    started = time.time()
+                    data["players"] = collect_player_stats(lcu, teams, game_id)
+                    publish()
+                    logger.debug(f"十人战绩：{time.time() - started:.1f} 秒")
+            except Exception as e:
+                logger.debug(f"十人战绩：{e}")
+
+        def guide():
+            try:
+                if self.option("aram_ai_guide") and time.time() >= self.guide_off_until:
+                    started = time.time()
+                    mine = next((p["team"] for p in teams if p.get("is_me")), None)
+                    resp = self.bot.post_aram_guide({
+                        "companion_version": VERSION, "game_id": game_id, "champion_id": info["champion_id"],
+                        "allies": [p["champion_id"] for p in teams if p["team"] == mine and p["champion_id"]],
+                        "enemies": [p["champion_id"] for p in teams if p["team"] != mine and p["champion_id"]]})
+                    if resp.get("ok") and resp.get("lines"):
+                        data["guide"] = resp["lines"]
+                        publish()
+                        logger.info(f"海克斯攻略（{time.time() - started:.1f} 秒）：" + "；".join(f"{ln.get('label')}：{ln.get('text')}" for ln in resp["lines"]))
+            except HttpError as e:
+                if e.status in (404, 503):            # 机器人不支持 / AI 没开 / 超了上限：这次开机别每局都问了
+                    self.guide_off_until = time.time() + (3600 if e.status == 404 else 600)
+                logger.debug(f"海克斯攻略：机器人回 {e.status}")
+            except Exception as e:
+                logger.debug(f"海克斯攻略：{e}")
+            if not data["guide"]:
+                data["guide_failed"] = True           # 让窗口别再显示「AI 正在写」的占位条
+                publish()
+
+        def card():
+            try:
+                data["card"] = self.champion_card(info["champion_id"])
+                publish()
+            except Exception as e:
+                logger.debug(f"英雄攻略：{e}")
+
+        threading.Thread(target=players, daemon=True, name="aram-players").start()
+        if data["mayhem"] and info.get("champion_id") and self.enabled and self.option("aram_panel"):
+            threading.Thread(target=guide, daemon=True, name="aram-guide").start()     # AI 最慢，最先出发
+            threading.Thread(target=card, daemon=True, name="aram-card").start()
+        loaded, deadline = False, time.time() + 900
+        while self.prepared_game == game_id and time.time() < deadline:
+            seconds = live_clock(lcu)
+            if seconds is not None and not loaded:
+                loaded = True
+                self.events.put(("loaded", game_id))
+            if seconds is not None and seconds >= ARAM_PANEL_HIDE_AT:
+                self.started_game = game_id
+                self.events.put(("started", game_id))
+                return
+            time.sleep(1.0 if loaded else 0.7)
+
+    @staticmethod
+    def _shoot(layout: dict) -> tuple[list, tuple, int]:
+        """截三张卡的标题。返回 ([(像素, 宽, 高)], 三条的指纹, 有几条看着像卡片标题)"""
+        shots, bits, looks = [], [], 0
+        for slot in range(3):
+            shot, ok, sig = aram_title_shot(layout, slot)
+            shots.append(shot)
+            bits.append(sig)
+            looks += bool(ok)
+        return shots, tuple(bits), looks
+
+    def _gone(self) -> None:
+        if self.shown_bits is not None:
+            self.events.put(("clear",))
+        self.shown_bits, self.miss, self.last_names, self.same_streak = None, 0, (), 0
+
+    def _scan(self) -> None:
+        """自动识别的一步"""
+        layout = game_layout()
+        if layout is None:                    # 切出去了：标注对不上位置，收掉；回来以后重新认
+            self._gone()
+            self.prev_bits = None
+            return
+        shots, bits, looks = self._shoot(layout)
+        stable = aram_same(bits, self.prev_bits)
+        self.prev_bits = bits
+        now = time.time()
+        if self.shown_bits is not None:
+            # 正显示着：只要还有两张像卡片就留着（鼠标悬停的那张会发光、变样）；连着两次都不像了才是选完了
+            if looks < 2:
+                self.miss += 1
+                if self.miss >= 2:
+                    self._gone()
+                return
+            self.miss = 0
+            if stable and not aram_same(bits, self.shown_bits) and now >= self.next_upload and not self.busy:
+                self._start(layout, shots, bits, auto=True)       # 重掷换了卡：重认一次，认出来之前旧的标注先留着
+            return
+        if not self.option("aram_auto"):
+            return                                # 自动标注关了：只有按热键才认（认出来以后上面那段照样盯着卡片）
+        if looks < 3 or not stable or self.busy or now < self.next_upload or now < self.auto_off_until:
+            return
+        if self.neg_bits is not None and now < self.neg_until and aram_same(bits, self.neg_bits):
+            return                                # 这个画面刚问过，机器人说不是卡片
+        self._start(layout, shots, bits, auto=True)
+
+    def press(self) -> None:
+        """热键：马上认一次"""
+        now = time.time()
+        if self.busy or now - self.last_press < ARAM_COOLDOWN:
+            return
+        self.last_press = now
+        layout = game_layout()
+        if layout is None:
+            logger.info(f"海克斯助手：按了 {self.hotkey_name}，但游戏窗口不在最前面，没法识别")
+            return                            # 游戏不在最前面：截不到，也没地方显示
+        shots, bits, looks = self._shoot(layout)
+        logger.info(f"海克斯助手：按了 {self.hotkey_name}，三张卡里有 {looks} 张看着像标题，正在识别")
+        self._start(layout, shots, bits, auto=False)
+
+    def _start(self, layout: dict, shots: list, bits: tuple, auto: bool) -> None:
+        self.busy = True
+        self.next_upload = time.time() + ARAM_RECHECK_SECONDS
+        threading.Thread(target=self._recognize, args=(layout, shots, bits, auto), daemon=True,
+                         name="aram-recognize").start()
+
+    def _recognize(self, layout: dict, shots: list, bits: tuple, auto: bool) -> None:
+        """把三条标题发给机器人认。auto=True 是自动扫到的：认不出来就悄悄算了，不在游戏画面上弹提示"""
+        try:
+            info = self.game_info() or {}
+            if not info.get("champion_id"):
+                if not auto:
+                    self.events.put(("msg", layout, "还没读到你这局的英雄，过几秒再按"))
+                return
+            if not auto:
+                self.events.put(("busy", layout))
+            started = time.time()
+            images = [base64.b64encode(png_gray(raw, width, height)).decode() for raw, width, height in shots]
+            resp = self.bot.post_aram_augments({
+                "companion_version": VERSION, "game_id": info.get("game_id"), "champion_id": info["champion_id"],
+                "game_mode": info.get("game_mode"), "queue_id": info.get("queue_id"),
+                "screen": list(layout["client"][2:]), "auto": auto, "images": images})
+            cards = [c for c in resp.get("cards") or [] if isinstance(c, dict)]
+            matched = sum(1 for c in cards if c.get("matched"))
+            if matched >= (2 if auto else 1):
+                self.events.put(("cards", layout, cards))
+                self.shown_bits, self.miss = bits, 0
+                self.neg_bits, self.neg_streak = None, 0
+                names = tuple(aram_card_line(c) for c in cards)
+                if names != self.last_names:
+                    self.last_names, self.same_streak = names, 0
+                    logger.info("海克斯：" + " / ".join(names) + f"（{int((time.time() - started) * 1000)} 毫秒）")
+                else:                                     # 画面动了但卡没换（多半是鼠标悬停）：下次重认往后推，最多隔 6 秒
+                    self.same_streak += 1
+                    self.next_upload = time.time() + min(6.0, ARAM_RECHECK_SECONDS * 2 ** min(self.same_streak, 3))
+            elif auto:
+                logger.debug("海克斯助手：自动上传了一次，机器人没认出名字：" + " / ".join(str(c.get("text") or "") for c in cards))
+                # 本机觉得像、机器人认不出名字：多半不是三选一（或者卡片还在翻）。记下这个画面，越是连着白发越晚再发
+                self.neg_bits, self.neg_until = bits, time.time() + 30
+                self.neg_streak += 1
+                self.next_upload = time.time() + min(8.0, ARAM_RECHECK_SECONDS * 2 ** min(self.neg_streak, 4))
+            elif any(c.get("text") for c in cards):
+                logger.info("海克斯助手：读到了字但对不上海克斯的名字：" + " / ".join(str(c.get("text") or "") for c in cards))
+                self.events.put(("cards", layout, cards))     # 读到字了但对不上：把读到的显示出来
+                self.shown_bits, self.miss = bits, 0
+            else:
+                logger.info("海克斯助手：机器人没在截图里读到字")
+                self.events.put(("msg", layout, "没看到海克斯卡片，等卡片翻开再按一次"))
+        except HttpError as e:
+            text = {401: "令牌失效了，看插件窗口的提示", 404: "机器人还不支持海克斯助手",
+                    429: "识别得太频繁了，等几秒", 503: "机器人暂时认不了，稍后再试"}.get(e.status, f"机器人出错（{e.status}）")
+            if auto:
+                # 自动的不往游戏画面上弹错误；这类错误短时间内再试也一样，歇一会儿（期间按热键仍然可以手动试）
+                pause = 600 if e.status in (401, 404) else 20
+                if time.time() >= self.auto_off_until:
+                    logger.info(f"海克斯助手：{text}，自动识别先停 {pause} 秒")
+                self.auto_off_until = time.time() + pause
+            else:
+                logger.info(f"海克斯助手：{text}")
+                self.events.put(("msg", layout, text))
+        except Exception as e:
+            if auto:
+                logger.debug(f"海克斯助手：没连上机器人（{e}）")
+                self.auto_off_until = time.time() + 10
+            else:
+                logger.info(f"海克斯助手：没连上机器人（{e}）")
+                self.events.put(("msg", layout, "没连上机器人，稍后再按"))
+        finally:
+            self.busy = False
+
+
+def aram_card_text(card: dict) -> str:
+    """一张卡在标注条上的字（梯队字母另外用大字显示）"""
+    if not card.get("matched"):
+        text = str(card.get("text") or "").strip()
+        return f"{text[:8]} · 没有数据" if text else "没认出来"
+    rank, rarity_rank = card.get("rank"), card.get("rarity_rank")
+    if not isinstance(rank, (int, float)):
+        return "没有统计数据"
+    text = ("总第 " if card.get("source") == "champion" else "全英雄第 ") + str(int(rank))
+    if isinstance(rarity_rank, (int, float)) and card.get("rarity_label"):
+        text += f" · {card['rarity_label']}第 {int(rarity_rank)}"
+    return text
+
+
+def aram_card_line(card: dict) -> str:
+    """日志里的一张卡"""
+    if not card.get("matched"):
+        return f"？{card.get('text') or ''}"
+    return f"{card.get('name')} {card.get('tier') or '-'}" + ("（推荐）" if card.get("best") else "")
+
+
 # 窗口：海克斯金色主题。插件本身照常在后台线程里跑，窗口只负责显示和启动游戏
 # ----------------------------------------------------------------------------
 HEX = {"bg": "#0A1428", "title": "#010A13", "gold": "#C8AA6E", "gold_hi": "#F0E6D2", "text": "#F0E6D2",
@@ -1652,6 +2623,961 @@ class _UiLogHandler(logging.Handler):
             pass
 
 
+ARAM_KEY_COLOR = "#FE01FD"        # 悬浮层的「透明色」：这个颜色的地方看得见后面的游戏
+ARAM_TIER_COLORS = {"S": "#F0C75E", "A": HEX["ok"], "B": HEX["text"]}
+ARAM_BAR_BG, ARAM_BAR_EDGE = HEX["title"], "#785A28"
+ARAM_SHOW_MS, ARAM_MSG_MS = 60000, 3000     # 标注平时由后台盯着卡片、卡片没了就收；60 秒只是保险
+ARAM_DROP = (-8, -4, -2, -1, 0)   # 标注条落下来的位移（像素，先快后慢），每 30 毫秒一步
+
+
+class AramOverlay:
+    """海克斯助手的标注：盖在游戏画面上的一层透明窗口，鼠标点得穿、不抢焦点，
+    三张卡片上方各一条深色金边的标注（梯队字母 + 排名），推荐的那条描边变亮、带「推荐」角标。
+    过程：三选一出来、后台认出三张卡 → 三条标注从左到右各隔 60 毫秒落下 8 像素到位 → 最后推荐的那条亮起来
+    → 一直留到选完（后台发现卡片没了就收掉）；重掷换了卡时原地换字，不重放动画；
+    游戏窗口移动、切走时立刻消失。按热键手动识别时，先在中间那张卡上方显示「识别中」和三个依次亮起的小点"""
+
+    def __init__(self, root, assistant: AramAssistant):
+        import tkinter as tk
+        self.tk, self.root, self.assistant = tk, root, assistant
+        self.layout = None
+        self.jobs: list = []            # 排着队的动画步骤，换画面时要全部取消
+        self.cards_on = False           # 现在显示的是不是一组卡的结果（不是「识别中」或提示）
+        self.data: dict = {}            # 后台准备好的选人 / 读条数据
+        self.panel = None               # 攻略侧栏（AramPanel），由 CompanionWindow 接上
+        self.badges = None              # 读条界面上的十人战绩标签（LoadingBadges）
+        self.dot_step = 0
+        win = self.win = tk.Toplevel(root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.config(bg=ARAM_KEY_COLOR)
+        win.attributes("-topmost", True)
+        win.attributes("-transparentcolor", ARAM_KEY_COLOR)
+        win.geometry("1x1+0+0")
+        # Tk 这边只在这里显示一次，之后的显示 / 隐藏都直接用系统接口（带「不激活」）：
+        # Tk 自己的 deiconify 会把窗口激活，对局中一激活游戏就丢了焦点
+        win.deiconify()
+        win.update_idletasks()
+        w = _aram_win()
+        self.hwnd = int(w.GetAncestor(win.winfo_id(), 2) or 0)          # GA_ROOT
+        # 分层 | 鼠标穿透 | 不抢焦点 | 不进任务栏
+        w.SetWindowLongW(self.hwnd, -20, w.GetWindowLongW(self.hwnd, -20) | 0x80000 | 0x20 | 0x08000000 | 0x80)
+        self._hide_window()
+        self.bars = [self._make_bar() for _ in range(3)]
+        root.after(40, self._poll)
+
+    def _hide_window(self) -> None:
+        # SWP_HIDEWINDOW | NOSIZE | NOMOVE | NOZORDER | NOACTIVATE
+        _aram_win().SetWindowPos(self.hwnd, None, 0, 0, 0, 0, 0x0080 | 0x0001 | 0x0002 | 0x0004 | 0x0010)
+
+    def _make_bar(self) -> dict:
+        tk = self.tk
+        edge = tk.Frame(self.win, bg=ARAM_BAR_EDGE)
+        body = tk.Frame(edge, bg=ARAM_BAR_BG)
+        tier = tk.Label(body, bg=ARAM_BAR_BG, fg=HEX["text"], padx=0, pady=0)
+        text = tk.Label(body, bg=ARAM_BAR_BG, fg=HEX["muted"], padx=0, pady=0, anchor="w")
+        tag = tk.Label(body, bg=HEX["gold"], fg=HEX["title"], text="推荐", padx=0, pady=0)
+        dots = [tk.Label(body, bg=ARAM_BAR_BG, fg=HEX["line"], text="●", padx=0, pady=0) for _ in range(3)]
+        return {"edge": edge, "body": body, "tier": tier, "text": text, "tag": tag, "dots": dots, "x": 0, "y": 0}
+
+    # --- 摆放 ---
+    def _geometry(self, layout: dict, slot: int) -> tuple[int, int, int, int]:
+        """第 slot 条标注在悬浮层里的位置：横向对准卡片中线，贴在卡片上沿的上方"""
+        left, top, cw, ch = layout["content"]
+        width, height = int(cw * 0.155), max(22, int(ch * 0.043))
+        cx = left + cw * ARAM_CARD_CENTERS[slot]
+        return int(cx - width / 2) - layout["client"][0], int(top + ch * 0.118) - layout["client"][1], width, height
+
+    def _show_window(self, layout: dict) -> bool:
+        if self.layout != layout:
+            left, top, width, height = layout["client"]
+            # HWND_TOPMOST，SWP_NOACTIVATE | SWP_SHOWWINDOW：用系统接口摆位置，副屏在左边（坐标是负数）时也对
+            if not _aram_win().SetWindowPos(self.hwnd, -1, left, top, width, height, 0x0010 | 0x0040):
+                return False
+            self.layout = layout
+            self.win.update_idletasks()               # 让 Tk 知道窗口变大了，下面按新尺寸摆标注条
+        self.win.attributes("-alpha", 1.0)
+        return True
+
+    def _style(self, bar: dict, layout: dict, *, bright: bool) -> None:
+        ch = layout["content"][3]
+        px = max(11, int(ch * 0.0165))
+        bar["tier"].config(font=(UI_FONT, -int(px * 1.35), "bold"))
+        bar["text"].config(font=(UI_FONT, -px))
+        bar["tag"].config(font=(UI_FONT, -max(10, px - 2)), padx=max(3, px // 3))
+        for d in bar["dots"]:
+            d.config(font=(UI_FONT, -max(8, px - 4)))
+        edge = 2 if bright else 1
+        bar["edge"].config(bg=HEX["gold_hi"] if bright else ARAM_BAR_EDGE)
+        bar["body"].place(x=edge, y=edge, relwidth=1, relheight=1, width=-2 * edge, height=-2 * edge)
+
+    def _fill(self, bar: dict, layout: dict, card: dict, *, bright: bool) -> None:
+        """把一张卡的结果摆进标注条：左边梯队大字，中间排名，推荐的在右边加角标"""
+        self._style(bar, layout, bright=bright)
+        pad = max(6, int(layout["content"][3] * 0.008))
+        for wdg in (bar["tier"], bar["text"], bar["tag"], *bar["dots"]):
+            wdg.place_forget()
+        tier = str(card.get("tier") or "") if card.get("matched") else ""
+        x = pad
+        if tier:
+            bar["tier"].config(text=tier, fg=ARAM_TIER_COLORS.get(tier, HEX["muted"]))
+            bar["tier"].place(x=x, rely=0.5, anchor="w")
+            bar["tier"].update_idletasks()
+            x += bar["tier"].winfo_reqwidth() + pad
+        strong = bright or (card.get("matched") and tier in ("S", "A"))
+        bar["text"].config(text=aram_card_text(card), fg=HEX["text"] if strong else HEX["muted"])
+        bar["text"].place(x=x, rely=0.5, anchor="w")
+        if bright:
+            bar["tag"].place(relx=1.0, x=-pad, rely=0.5, anchor="e")
+
+    # --- 三种画面 ---
+    def show_busy(self, layout: dict) -> None:
+        self.clear(keep_window=True)
+        if not self._show_window(layout):
+            return
+        bar = self.bars[1]
+        self._style(bar, layout, bright=False)
+        pad = max(6, int(layout["content"][3] * 0.008))
+        bar["text"].config(text="识别中", fg=HEX["text"])
+        bar["text"].place(x=pad, rely=0.5, anchor="w")
+        bar["text"].update_idletasks()
+        x = pad + bar["text"].winfo_reqwidth() + pad
+        for d in bar["dots"]:
+            d.config(fg=HEX["line"])
+            d.place(x=x, rely=0.5, anchor="w")
+            x += d.winfo_reqwidth() + 2
+        bx, by, bw, bh = self._geometry(layout, 1)
+        bar["edge"].place(x=bx, y=by, width=bw, height=bh)
+        self.dot_step = 0
+        self._tick_dots()
+        self._later(6000, self.clear)                 # 机器人一直没回：别让「识别中」挂在那儿
+        self._watch()
+
+    def _tick_dots(self) -> None:
+        """三个小点依次亮起，亮满后全灭再来"""
+        dots = self.bars[1]["dots"]
+        lit = self.dot_step % 4
+        for i, d in enumerate(dots):
+            d.config(fg=HEX["gold"] if i < lit else HEX["line"])
+        self.dot_step += 1
+        self._later(220, self._tick_dots)
+
+    def show_cards(self, layout: dict, cards: list) -> None:
+        # 已经显示着一组卡（重掷后重认、鼠标悬停引起的重认）：原地换字，不再重放落下的动画，免得一闪一闪
+        animate = not (self.cards_on and self.layout == layout)
+        self.clear(keep_window=True)
+        if not self._show_window(layout):
+            return
+        by_slot = {c.get("slot"): c for c in cards if isinstance(c.get("slot"), int)}
+        best = None
+        for slot in range(3):
+            card = by_slot.get(slot)
+            if card is None:
+                continue
+            bar = self.bars[slot]
+            is_best = bool(card.get("best") and card.get("matched"))
+            bx, by, bw, bh = self._geometry(layout, slot)
+            if animate:
+                self._fill(bar, layout, card, bright=False)      # 先都按普通样子落下来，推荐的最后再亮
+                for step, dy in enumerate(ARAM_DROP):
+                    self._later(slot * 60 + step * 30, lambda b=bar, x=bx, y=by + dy, w=bw, h=bh: b["edge"].place(x=x, y=y, width=w, height=h))
+                if is_best:
+                    best = (bar, card)
+            else:
+                self._fill(bar, layout, card, bright=is_best)
+                bar["edge"].place(x=bx, y=by, width=bw, height=bh)
+        if best:
+            self._later(2 * 60 + (len(ARAM_DROP) - 1) * 30 + 80, lambda: self._fill(best[0], layout, best[1], bright=True))
+        self.cards_on = True
+        self._later(ARAM_SHOW_MS, self._fade_out)
+        self._watch()
+
+    def show_message(self, layout: dict, text: str) -> None:
+        self.clear(keep_window=True)
+        if not self._show_window(layout):
+            return
+        bar = self.bars[1]
+        self._style(bar, layout, bright=False)
+        bar["text"].config(text=text, fg=HEX["text"])
+        bar["text"].update_idletasks()
+        pad = max(6, int(layout["content"][3] * 0.008))
+        bar["text"].place(x=pad, rely=0.5, anchor="w")
+        bx, by, bw, bh = self._geometry(layout, 1)
+        need = bar["text"].winfo_reqwidth() + 2 * pad + 4        # 提示的字比排名长：条跟着变宽，仍然居中
+        if need > bw:
+            bx, bw = bx - (need - bw) // 2, need
+        bar["edge"].place(x=bx, y=by, width=bw, height=bh)
+        self._later(ARAM_MSG_MS, self._fade_out)
+        self._watch()
+
+    # --- 收尾 ---
+    def _fade_out(self, step: int = 0) -> None:
+        """整层 150 毫秒淡出（透明色抠掉的部分一直是透的，淡的是标注条）"""
+        if step >= 5:
+            self.clear()
+            return
+        try:
+            self.win.attributes("-alpha", 1.0 - (step + 1) * 0.2)
+        except Exception:
+            pass
+        self._later(30, lambda: self._fade_out(step + 1))
+
+    def clear(self, keep_window: bool = False) -> None:
+        for job in self.jobs:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self.jobs.clear()
+        self.cards_on = False
+        for bar in self.bars:
+            bar["edge"].place_forget()
+            for wdg in (bar["tier"], bar["text"], bar["tag"], *bar["dots"]):
+                wdg.place_forget()
+        if not keep_window:
+            self.layout = None
+            self._hide_window()
+            self.win.attributes("-alpha", 1.0)
+
+    def _later(self, ms: int, fn) -> None:
+        self.jobs.append(self.root.after(ms, fn))
+
+    def _watch(self) -> None:
+        """显示着的时候每 200 毫秒看一眼：游戏窗口挪了、切走了，标注就对不上位置了，马上收掉"""
+        if self.layout is None:
+            return
+        if game_layout() != self.layout:
+            self.clear()
+            return
+        self._later(200, self._watch)
+
+    def _poll(self) -> None:
+        try:
+            while True:
+                ev = self.assistant.events.get_nowait()
+                if ev[0] in ("select", "pregame", "started", "loaded"):
+                    self.data[ev[0]] = ev[1]           # 选人梯队 / 读条数据（十人战绩、攻略）/ 读完条了 / 开打一阵了
+                    if self.badges is not None:
+                        if ev[0] == "pregame":
+                            self.badges.set_pregame(ev[1])
+                        elif ev[0] == "loaded":
+                            self.badges.set_loaded(ev[1])
+                    if self.panel is not None:
+                        if ev[0] == "select":
+                            self.panel.set_select(ev[1])
+                        elif ev[0] == "pregame":
+                            self.panel.set_pregame(ev[1])
+                        elif ev[0] == "started":
+                            self.panel.set_game_started(ev[1])
+                        elif ev[0] == "loaded":
+                            self.panel.set_loaded(ev[1])
+                elif ev[0] == "icons":
+                    if self.panel is not None:
+                        self.panel.fill_icons()            # 英雄头像读到了：把占位换成头像
+                elif ev[0] == "clear":
+                    self.clear()
+                elif game_layout() != ev[1]:
+                    self.clear()                       # 等机器人回话的工夫窗口变了：这次结果不画
+                elif ev[0] == "busy":
+                    self.show_busy(ev[1])
+                elif ev[0] == "cards":
+                    self.show_cards(ev[1], ev[2])
+                elif ev[0] == "msg":
+                    self.show_message(ev[1], ev[2])
+        except Exception as e:
+            if type(e).__name__ != "Empty":
+                logger.debug(f"海克斯标注出错: {e}")
+                try:
+                    self.clear()
+                except Exception:
+                    pass
+        self.root.after(40, self._poll)
+
+
+_client_hwnd = 0
+
+
+ARAM_LOAD_CENTERS = (0.1911, 0.3453, 0.4995, 0.6536, 0.8078)   # 读条界面每排五张卡的中线 ÷ 画面宽（1080p 实测）
+ARAM_LOAD_BOTTOMS = (0.4889, 0.9741)                            # 上排、下排卡片的下沿 ÷ 画面高
+
+
+# 按近期 KDA 分的档：(KDA 至少多少, 叫什么)。都不到的是「牛马」；一队里的「大哥」不看 KDA，直接是「精品上等马」。
+# 两套线：大乱斗一类的模式助攻多、KDA 普遍高一截，线也高；其它模式（召唤师峡谷等）用低一档的线。
+# 用哪套看的是「现在这一局」的模式
+HORSE_ARAM_MODES = {"ARAM", "KIWI", "KIWI_JADE"}
+HORSE_LINES_ARAM = ((4.5, "上等马"), (3.2, "中等马"), (2.2, "下等马"))
+HORSE_LINES_OTHER = ((3.5, "上等马"), (2.5, "中等马"), (1.8, "下等马"))
+
+
+def player_horse(row: dict, game_mode: str = "") -> tuple[str, str]:
+    """一个人是什么马：(叫法, 颜色)。没有战绩的不评。game_mode 是现在这一局的模式名"""
+    kda = row.get("kda")
+    if not row.get("games") or kda is None:
+        return "", ""
+    if row.get("boss"):
+        return "精品上等马", "#F0C75E"
+    lines = HORSE_LINES_ARAM if str(game_mode or "").upper() in HORSE_ARAM_MODES else HORSE_LINES_OTHER
+    name = next((label for floor, label in lines if kda >= floor), "牛马")
+    return name, {"上等马": HEX["ok"], "中等马": HEX["text"], "下等马": HEX["muted"], "牛马": HEX["bad"]}[name]
+
+
+def player_badge(row: dict, game_mode: str = "") -> tuple[str, str, str, str, str]:
+    """一个人的战绩标签：(主文字, 主文字颜色, 开黑, 是什么马, 马的颜色)。胜率高的青色、低的红色"""
+    games, rate, kda = row.get("games") or 0, row.get("win_rate"), row.get("kda")
+    if not games or rate is None:
+        return "没有近期战绩", HEX["muted"], "", "", ""
+    text = f"胜率 {rate * 100:.0f}%"
+    if kda is not None:
+        text += f" · KDA {kda:g}"
+    color = HEX["ok"] if rate >= 0.55 else HEX["bad"] if rate <= 0.45 else HEX["text"]
+    size = row.get("premade") or 0
+    premade = {2: "双排", 3: "三排", 4: "四排", 5: "五排"}.get(size, "开黑") if size >= 2 else ""
+    horse, horse_color = player_horse(row, game_mode)
+    return text, color, premade, horse, horse_color
+
+
+class LoadingBadges:
+    """读条界面上的十人战绩：每张英雄卡片的底边贴一条小标签（近 20 局胜率 · KDA，开黑的标「双排 / 三排」，
+    再按 KDA 评个「上等马 / 中等马 / 下等马 / 牛马」，一队里近期打得最凶的那个是「精品上等马」）。透明、鼠标点得穿、不抢焦点，和 AramOverlay 是同一种窗口。
+    过程：战绩查到了、游戏窗口也出来了 → 十条标签一起 150 毫秒淡入 → 读条结束（游戏里开始走时间）→ 淡出。
+    卡片从左到右的顺序用的是客户端的选英雄记录，上排是蓝色方、下排是红色方"""
+
+    def __init__(self, root, assistant: AramAssistant):
+        import tkinter as tk
+        self.tk, self.root = tk, root
+        self.rows = None              # 十个人的战绩；None = 没有要显示的
+        self.game_id = None
+        self.game_mode = ""           # 这一局的模式名：决定「马」用哪套分档线
+        self.loaded_game = None       # 哪一局已经读完条了
+        self.layout = None            # 现在摆在哪个画面上；None = 没显示
+        self.fading = False
+        win = self.win = tk.Toplevel(root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.config(bg=ARAM_KEY_COLOR)
+        win.attributes("-topmost", True)
+        win.attributes("-transparentcolor", ARAM_KEY_COLOR)
+        win.attributes("-alpha", 0.0)
+        win.geometry("1x1+0+0")
+        win.deiconify()               # 只在这里用 Tk 显示一次，之后都用系统接口（不激活）
+        win.update_idletasks()
+        w = _aram_win()
+        self.hwnd = int(w.GetAncestor(win.winfo_id(), 2) or 0)
+        w.SetWindowLongW(self.hwnd, -20, w.GetWindowLongW(self.hwnd, -20) | 0x80000 | 0x20 | 0x08000000 | 0x80)
+        self._hide_now()
+        self.bars = []
+        for _ in range(10):
+            edge = tk.Frame(win, bg=ARAM_BAR_EDGE)
+            body = tk.Frame(edge, bg=ARAM_BAR_BG)
+            body.place(x=1, y=1, relwidth=1, relheight=1, width=-2, height=-2)
+            main = tk.Label(body, bg=ARAM_BAR_BG, fg=HEX["text"], padx=0, pady=0)
+            team = tk.Label(body, bg=ARAM_BAR_BG, fg=HEX["gold"], padx=0, pady=0)        # 双排 / 三排
+            tag = tk.Label(body, bg=ARAM_BAR_BG, fg=HEX["gold"], padx=0, pady=0)         # 上等马 / 牛马 …
+            self.bars.append((edge, main, team, tag))
+        root.after(250, self._watch)
+
+    def set_pregame(self, data: dict | None) -> None:
+        if data is None:
+            self.rows, self.game_id = None, None
+        elif data.get("players"):
+            self.rows, self.game_id, self.game_mode = data["players"], data.get("game_id"), data.get("game_mode") or ""
+        self._update()
+
+    def set_loaded(self, game_id) -> None:
+        self.loaded_game = game_id
+        self._update()
+
+    def _hide_now(self) -> None:
+        _aram_win().SetWindowPos(self.hwnd, None, 0, 0, 0, 0, 0x0080 | 0x0001 | 0x0002 | 0x0004 | 0x0010)
+        self.layout, self.fading = None, False
+
+    def _fade(self, step: int, out: bool) -> None:
+        if out and not self.fading:
+            return
+        if step > 5:
+            if out:
+                self._hide_now()
+            return
+        try:
+            self.win.attributes("-alpha", (5 - step) / 5 if out else step / 5)
+        except Exception:
+            pass
+        self.root.after(30, lambda: self._fade(step + 1, out))
+
+    def _update(self) -> None:
+        want = self.rows is not None and self.game_id != self.loaded_game
+        layout = game_layout() if want else None
+        if layout is None:
+            if self.layout is not None and not self.fading:
+                self.fading = True
+                self._fade(1, True)
+            return
+        if layout == self.layout and not self.fading:
+            self._fill(layout)                    # 位置没变：只更新文字（数据可能刚补齐）
+            return
+        first = self.layout is None or self.fading
+        self.fading = False
+        left, top, width, height = layout["client"]
+        if not _aram_win().SetWindowPos(self.hwnd, -1, left, top, width, height, 0x0010 | 0x0040):
+            return
+        self.layout = layout
+        self.win.update_idletasks()
+        self._fill(layout)
+        if first:
+            self._fade(0, False)
+        else:
+            self.win.attributes("-alpha", 1.0)
+
+    def _fill(self, layout: dict) -> None:
+        left, top, cw, ch = layout["content"]
+        ox, oy = left - layout["client"][0], top - layout["client"][1]
+        # 和卡片差不多宽（1080p 上 250x18），正好盖住名字下面那行称号；左边胜率和 KDA，右边开黑和「马」
+        bw, bh = int(cw * 0.1305), max(15, int(ch * 0.0172))
+        px = max(9, int(ch * 0.0118))
+        pad = max(4, int(ch * 0.005))
+        used = set()
+        for row in self.rows or []:
+            team_no, slot = row.get("team"), row.get("slot")
+            if team_no not in (1, 2) or not isinstance(slot, int) or not 0 <= slot < 5:
+                continue
+            index = (team_no - 1) * 5 + slot
+            used.add(index)
+            edge, main, team, tag = self.bars[index]
+            text, color, premade, horse, horse_color = player_badge(row, self.game_mode)
+            main.config(text=text, fg=color, font=(UI_FONT, -px, "bold"))
+            x = ox + int(cw * ARAM_LOAD_CENTERS[slot]) - bw // 2
+            y = oy + int(ch * ARAM_LOAD_BOTTOMS[team_no - 1]) - bh - 1
+            team.place_forget()
+            tag.place_forget()
+            if not horse and not premade:
+                main.place(relx=0.5, rely=0.5, anchor="center")
+            else:
+                main.place(x=pad, rely=0.5, anchor="w")
+                right = -pad
+                if horse:
+                    tag.config(text=horse, fg=horse_color, font=(UI_FONT, -px, "bold"))
+                    tag.place(relx=1.0, x=right, rely=0.5, anchor="e")
+                    tag.update_idletasks()
+                    right -= tag.winfo_reqwidth() + pad
+                if premade:
+                    team.config(text=premade, fg=HEX["gold"], font=(UI_FONT, -px))
+                    team.place(relx=1.0, x=right, rely=0.5, anchor="e")
+            edge.config(bg=HEX["gold_hi"] if row.get("is_me") else ARAM_BAR_EDGE)
+            edge.place(x=x, y=y, width=bw, height=bh)
+        for i, bar in enumerate(self.bars):
+            if i not in used:
+                bar[0].place_forget()
+
+    def _watch(self) -> None:
+        """每 250 毫秒看一眼：游戏窗口出来了 / 挪了 / 切走了，标签跟着出现、移动、收起"""
+        try:
+            want = self.rows is not None and self.game_id != self.loaded_game
+            if want or self.layout is not None:
+                if (game_layout() if want else None) != self.layout:
+                    self._update()
+        except Exception as e:
+            logger.debug(f"战绩标签出错: {e}")
+        self.root.after(250, self._watch)
+
+
+def find_client_window() -> int:
+    """英雄联盟客户端（大厅 / 选人界面）的窗口。没开就是 0。
+    客户端有十来个同类名的窗口，只有一个是看得见的大窗口，其余是 198x56 的隐藏小窗口，所以不能随便拿第一个：
+    把同类名的都过一遍，取看得见的里面最大的。找到后记住，窗口还在就不用每次重找"""
+    global _client_hwnd
+    w = _aram_win()
+    cls = w.ctypes.create_unicode_buffer(32)
+    if _client_hwnd and w.IsWindowVisible(_client_hwnd) and w.GetClassNameW(_client_hwnd, cls, 32) and cls.value == "RCLIENT":
+        return _client_hwnd
+    best = [0, 0]
+
+    def visit(hwnd, _):
+        if w.GetClassNameW(hwnd, cls, 32) and cls.value == "RCLIENT" and w.IsWindowVisible(hwnd):
+            rect = w.wintypes.RECT()
+            if w.GetWindowRect(hwnd, w.ctypes.byref(rect)):
+                area = (rect.right - rect.left) * (rect.bottom - rect.top)
+                if rect.right - rect.left >= 600 and area > best[1]:
+                    best[0], best[1] = int(hwnd or 0), area
+        return True
+    w.EnumWindows(w.ENUMPROC(visit), 0)
+    _client_hwnd = best[0]
+    return _client_hwnd
+
+
+def client_window_rect() -> tuple[int, int, int, int] | None:
+    """客户端窗口在最前面时，返回它在屏幕上的位置 (左, 上, 右, 下)；切走了、最小化了返回 None"""
+    w = _aram_win()
+    hwnd = find_client_window()
+    if not hwnd or hwnd != int(w.GetForegroundWindow() or 0) or w.IsIconic(hwnd) or not w.IsWindowVisible(hwnd):
+        return None
+    rect = w.wintypes.RECT()
+    if not w.GetWindowRect(hwnd, w.ctypes.byref(rect)) or rect.right - rect.left < 400:
+        return None
+    return rect.left, rect.top, rect.right, rect.bottom
+
+
+def monitor_work_area(left: int, top: int, right: int, bottom: int) -> tuple[int, int, int, int]:
+    """这块区域所在那台显示器的可用范围（去掉任务栏）。查不到就当作只有这块区域"""
+    w = _aram_win()
+    try:
+        rect = w.wintypes.RECT(left, top, right, bottom)
+        info = w.MONITORINFO()
+        info.cbSize = w.ctypes.sizeof(w.MONITORINFO)
+        if w.GetMonitorInfoW(w.MonitorFromRect(w.ctypes.byref(rect), 2), w.ctypes.byref(info)):     # MONITOR_DEFAULTTONEAREST
+            return info.rcWork.left, info.rcWork.top, info.rcWork.right, info.rcWork.bottom
+    except Exception:
+        pass
+    return left, top, right, bottom
+
+
+class AramPanel:
+    """选人梯队 + 英雄攻略的侧栏：一条窄窗口，鼠标点得穿、不抢焦点。
+    - 选人时贴在客户端右边（右边放不下就贴左边，两边都放不下就压在客户端右侧里面），跟着客户端移动；
+      显示我现在的英雄的梯队、候选席上每个英雄的梯队（按强到弱排）、这个英雄的技能加点 / 召唤师技能 / 出装 / 最强海克斯
+    - 读条时贴在游戏画面右侧，多一段 AI 按这局阵容写的建议；开局 40 秒后自己收起
+    - 收起以后，这一局里按住 Tab（看计分板的键）侧栏跟着出来，松开就收起。只是看一眼按键状态，不拦截，游戏照样收到 Tab
+    - 标题左边是我这个英雄的头像，候选席每个英雄前面也有小头像。图是从本机客户端读的（不联网），
+      还没读到时先放一块同样大小的深色方块占位，读到了原地换上，版面不动
+    过程：出现时从右边滑进来 12 像素、同时 150 毫秒淡入；攻略还没取到时先显示几条灰色占位条（一明一暗地闪），
+    取到了原地换成内容；换英雄时标题马上换，下面先变回占位条再填上；离开选人界面 / 切到别的窗口时淡出"""
+
+    def __init__(self, root, assistant: AramAssistant, px: float = 1.0):
+        import tkinter as tk
+        self.tk, self.root, self.assistant, self.px = tk, root, assistant, max(1.0, px)
+        self.select = None            # 选人界面的数据（None = 不在选人）
+        self.pregame = None           # 读条的数据（None = 不在对局）
+        self.started_game = None      # 哪一局已经开打了：那一局的侧栏收起
+        self.loaded_game = None       # 哪一局已经读完条、进了游戏
+        self.inside = False           # 这次是不是压在游戏画面里面（游戏占满屏幕，外面没地方放）
+        self.pregame_at = 0.0         # 这一局的读条数据是什么时候来的（太久了也收起，防止一直挂着）
+        self.peek = False             # 现在是不是按着 Tab（收起以后按住再看一眼）
+        self.icons: dict = {}         # (英雄编号, 边长) -> 缩好的头像图；None = 这张图解不开，不再试
+        self.icon_slots: list = []    # 现在画面上还在等头像的位置：(英雄编号, 边长, 那个 Label)
+        self.show_gen = 0             # 第几次「滑进来」：收起 / 淡出以后，上一次滑进来剩下的几步就不走了
+        self.pad = int(12 * max(1.0, px))
+        self.shown = None             # 现在摆在哪：(模式, 目标矩形)；None = 没显示
+        self.rendered = None          # 现在画的是哪份内容（没变就不重画）
+        self.fading = False
+        self.jobs: list = []
+        self.pulse_on = False
+        self.skeletons: list = []
+        self.full_width = int(300 * self.px)
+        self.width = self.full_width  # 这次显示用多宽（游戏占满屏幕时只能放进读条界面右侧的空白，会窄一些）
+        win = self.win = tk.Toplevel(root)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.config(bg=ARAM_BAR_EDGE)
+        win.attributes("-topmost", True)
+        win.attributes("-alpha", 0.0)
+        win.geometry(f"{self.width}x100+0+0")
+        self.body = tk.Frame(win, bg=HEX["bg"])
+        self.body.place(x=1, y=1, relwidth=1, relheight=1, width=-2, height=-2)
+        win.deiconify()               # 只在这里用 Tk 显示一次，之后都用系统接口（不激活），理由同 AramOverlay
+        win.update_idletasks()
+        w = _aram_win()
+        self.hwnd = int(w.GetAncestor(win.winfo_id(), 2) or 0)
+        w.SetWindowLongW(self.hwnd, -20, w.GetWindowLongW(self.hwnd, -20) | 0x80000 | 0x20 | 0x08000000 | 0x80)
+        self._hide_now()
+        root.after(200, self._watch)
+        root.after(300, self._watch_key)
+
+    # --- 后台送来的数据 ---
+    def set_select(self, view: dict | None) -> None:
+        self.select = view
+        self._update()
+
+    def set_pregame(self, data: dict | None) -> None:
+        if data is not None and (self.pregame or {}).get("game_id") != data.get("game_id"):
+            self.pregame_at = time.time()
+        self.pregame = data
+        self._update()
+
+    def set_game_started(self, game_id) -> None:
+        self.started_game = game_id
+        self._update()
+
+    def set_loaded(self, game_id) -> None:
+        self.loaded_game = game_id
+        self._update()
+
+    def _compact(self, mode: str) -> bool:
+        """压在游戏画面里、而且已经进了游戏：右下角有队友头像和小地图，侧栏要短，只留 AI 建议和最要紧的几行"""
+        return mode == "game" and self.inside and (self.pregame or {}).get("game_id") == self.loaded_game
+
+    # --- 该不该显示、摆在哪 ---
+    def _has_guide(self) -> bool:
+        """现在这一局有没有攻略可看（海克斯大乱斗、攻略卡或 AI 建议至少到了一样）"""
+        p = self.pregame
+        return bool(p and p.get("mayhem") and (p.get("card") or p.get("guide")))
+
+    def _target(self):
+        """返回 (模式, 贴靠的矩形 (左, 上, 右, 下))；现在不该显示就返回 None"""
+        if self._has_guide() and (self.peek or (self.pregame.get("game_id") != self.started_game
+                                                and time.time() - self.pregame_at < 240)):
+            layout = game_layout()
+            if layout:
+                left, top, width, height = layout["client"]
+                return "game", (left, top, left + width, top + height)
+            return None
+        if self.select and (self.select.get("mine") or self.select.get("bench")):
+            rect = client_window_rect()
+            if rect:
+                return "select", rect
+        return None
+
+    def _place(self, mode: str, rect: tuple, height: int) -> tuple[int, int]:
+        left, top, right, bottom = rect
+        gap = int(8 * self.px)
+        wl, wt, wr, wb = monitor_work_area(*rect)
+        if right + gap + self.width <= wr:
+            x = right + gap
+        elif left - gap - self.width >= wl:
+            x = left - gap - self.width
+        elif mode == "game":          # 游戏占满了屏幕：压在画面里，靠右、偏上（读条界面最右边一列卡片的右侧是空的）
+            return right - self.width - int(6 * self.px), top + int((bottom - top) * 0.14)
+        else:
+            x = right - self.width - gap
+        return x, max(wt, min(top, wb - height))
+
+    def _width_for(self, mode: str, rect: tuple) -> int:
+        """这次侧栏用多宽。能贴在窗口外面就用正常宽度；游戏占满屏幕时只有读条界面右边那条空白（画面宽的 12.6%）"""
+        left, top, right, bottom = rect
+        gap = int(8 * self.px)
+        wl, wt, wr, wb = monitor_work_area(*rect)
+        if mode == "select" or right + gap + self.full_width <= wr or left - gap - self.full_width >= wl:
+            self.inside = False
+            return self.full_width
+        self.inside = True
+        width, height = right - left, bottom - top
+        content = min(width, round(height * 16 / 9))
+        margin = (width - content) / 2 + content * 0.126
+        return min(self.full_width, max(int(margin - 8 * self.px), int(170 * self.px)))
+
+    def _update(self) -> None:
+        target = self._target()
+        if target is None:
+            if self.shown is not None and not self.fading:
+                self._fade_out()
+            return
+        mode, rect = target
+        self.width = self._width_for(mode, rect)
+        content = self._content(mode)
+        if content != self.rendered or self.shown is None:
+            self._render(mode, content)
+            self.rendered = content
+        self.body.update_idletasks()
+        # 选人：和客户端一样高；读条：画面的 76%；全屏对局中：到 66% 屏高为止（再往下是队友头像和小地图）
+        limit = (rect[3] - rect[1]) if mode == "select" else int((rect[3] - rect[1]) * (0.52 if self._compact(mode) else 0.76))
+        height = max(int(60 * self.px), min(limit, self.inner.winfo_reqheight() + 2 * self.pad + 2))
+        x, y = self._place(mode, rect, height)
+        first = self.shown is None
+        self.shown = (mode, rect)
+        self._cancel_fade()
+        w = _aram_win()
+        if first:                     # 从右边滑进来 12 像素，同时淡入
+            slide = int(12 * self.px)
+            self.show_gen += 1
+            for step in range(6):
+                self._later(step * 30, lambda s=step, gen=self.show_gen: gen == self.show_gen and not self.fading and (
+                    w.SetWindowPos(self.hwnd, -1, x + slide - slide * s // 5, y, self.width, height, 0x0010 | 0x0040),
+                    self.win.attributes("-alpha", s / 5)))
+        else:
+            w.SetWindowPos(self.hwnd, -1, x, y, self.width, height, 0x0010 | 0x0040)
+            self.win.attributes("-alpha", 1.0)       # 完全不透：留一点透明度的话，后面窗口的字会隐约透出来
+
+    # --- 英雄头像 ---
+    def _icon(self, champion_id, size: int):
+        """这个英雄缩到 size 像素见方的头像；图还没读到返回 None。
+        客户端给的是 128 像素的图，四周有一圈黑边：每边裁掉十二分之一再缩。Tk 自带的缩放只会隔行抽点、有锯齿，
+        所以自己按块取平均"""
+        key = (champion_id, size)
+        if key in self.icons:
+            return self.icons[key]
+        raw = getattr(self.assistant, "icon_bytes", lambda c: None)(champion_id)
+        if not raw:
+            return None
+        try:
+            tk, call, split = self.tk, self.root.tk.call, self.root.tk.splitlist
+            src = tk.PhotoImage(data=base64.b64encode(raw))
+            rows = [split(r) for r in split(call(src.name, "data"))]
+            sw, sh = len(rows[0]), len(rows)
+            cut = round(min(sw, sh) / 12)
+            px = [[(int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)) for c in r[cut:sw - cut]] for r in rows[cut:sh - cut]]
+            sw, sh = len(px[0]), len(px)
+            out_rows = []
+            for dy in range(size):
+                y0 = dy * sh // size
+                y1 = max(y0 + 1, (dy + 1) * sh // size)
+                line = []
+                for dx in range(size):
+                    x0 = dx * sw // size
+                    x1 = max(x0 + 1, (dx + 1) * sw // size)
+                    n = (y1 - y0) * (x1 - x0)
+                    r = g = b = 0
+                    for y in range(y0, y1):
+                        for cr, cg, cb in px[y][x0:x1]:
+                            r, g, b = r + cr, g + cg, b + cb
+                    line.append(f"#{r // n:02x}{g // n:02x}{b // n:02x}")
+                out_rows.append("{" + " ".join(line) + "}")
+            out = tk.PhotoImage(width=size, height=size)
+            out.put(" ".join(out_rows))
+            self.icons[key] = out
+        except Exception as e:
+            logger.debug(f"英雄头像 {champion_id} 解不开: {e}")
+            self.icons[key] = None
+        return self.icons[key]
+
+    def _icon_slot(self, parent, champion_id, size: int, bg: str):
+        """放头像的位置：一个固定大小的方块。图没到时是一块深色占位，到了由 fill_icons 原地换上"""
+        slot = self.tk.Label(parent, bg=bg, bd=0, padx=0, pady=0, image=self._blank(size), width=size, height=size)
+        if isinstance(champion_id, int) and champion_id > 0:
+            self.icon_slots.append((champion_id, size, slot))
+        return slot
+
+    def _blank(self, size: int):
+        key = ("blank", size)
+        if key not in self.icons:
+            self.icons[key] = self.tk.PhotoImage(width=size, height=size)
+        return self.icons[key]
+
+    def fill_icons(self) -> None:
+        """把已经读到的头像放进画面上等着的位置；还没读到的，让后台去读"""
+        waiting, missing = [], []
+        for champion_id, size, slot in self.icon_slots:
+            try:
+                image = self._icon(champion_id, size)
+                if image is not None:
+                    slot.config(image=image)
+                elif (champion_id, size) not in self.icons:
+                    waiting.append((champion_id, size, slot))
+                    missing.append(champion_id)
+            except Exception:
+                pass                  # 这个位置已经随着重画没了
+        self.icon_slots = waiting
+        if missing and hasattr(self.assistant, "want_icons"):
+            self.assistant.want_icons(missing)
+
+    # --- 内容 ---
+    def _content(self, mode: str) -> tuple:
+        """这次该画什么：整理成一个能比较的元组，没变就不重画"""
+        if mode == "game":
+            card, guide = self.pregame.get("card"), self.pregame.get("guide")
+            champ = (card or {}).get("champion") or {}
+            mine = {"name": champ.get("name"), "tier": champ.get("tier"), "rank": champ.get("rank"), "win_rate": champ.get("win_rate"),
+                    "champion_id": self.pregame.get("champion_id")}
+            bench, waiting = (), guide is None and not self.pregame.get("guide_failed")
+        else:
+            card, guide, waiting = self.select.get("card"), None, False
+            mine = self.select.get("mine") or {}
+            bench = tuple((b.get("name"), b.get("tier"), b.get("rank"), b.get("champion_id")) for b in self.select.get("bench") or [])
+        return (mode, json.dumps(mine, sort_keys=True, ensure_ascii=False), bench,
+                json.dumps(card, sort_keys=True, ensure_ascii=False) if card else None,
+                json.dumps(guide, ensure_ascii=False) if guide else None, waiting, self.width, self._compact(mode))
+
+    def _render(self, mode: str, content: tuple) -> None:
+        tk = self.tk
+        for job in self.jobs:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self.jobs.clear()
+        self.fading = False
+        self.skeletons = []
+        self.icon_slots = []
+        for child in self.body.winfo_children():
+            child.destroy()
+        pad = self.pad
+        wrap = self.width - 2 * pad - 2
+        inner = self.inner = tk.Frame(self.body, bg=HEX["bg"])
+        inner.pack(fill="x", padx=pad, pady=(pad, pad))
+        mine = json.loads(content[1])
+        compact = bool(content[7])
+        card = json.loads(content[3]) if content[3] else None
+        guide = json.loads(content[4]) if content[4] else None
+
+        def text(s, color=HEX["text"], size=10, bold=False, top=0):
+            tk.Label(inner, text=s, bg=HEX["bg"], fg=color, font=(UI_FONT, size, "bold" if bold else "normal"),
+                     wraplength=wrap, justify="left", anchor="w").pack(fill="x", pady=(int(top * self.px), 0))
+
+        def section(title):
+            text(title, HEX["gold"], 9, top=10)
+
+        def skeleton(widths):
+            for frac in widths:
+                bar = tk.Frame(inner, bg=HEX["btn"], height=int(12 * self.px), width=int(wrap * frac))
+                bar.pack(anchor="w", pady=(int(8 * self.px), 0))
+                self.skeletons.append(bar)
+
+        # 标题：头像 + 梯队大字 + 英雄名，名字下面是排名胜率
+        top = tk.Frame(inner, bg=HEX["bg"])
+        top.pack(fill="x")
+        mine_id = mine.get("champion_id")
+        if isinstance(mine_id, int) and mine_id > 0:
+            frame = tk.Frame(top, bg=HEX["gold"])                 # 头像外面一圈细金边
+            frame.pack(side="left", padx=(0, int(10 * self.px)))
+            self._icon_slot(frame, mine_id, int(44 * self.px), HEX["btn"]).pack(padx=1, pady=1)
+        right = tk.Frame(top, bg=HEX["bg"])
+        right.pack(side="left", fill="x", expand=True)
+        head = tk.Frame(right, bg=HEX["bg"])
+        head.pack(fill="x")
+        tier = str(mine.get("tier") or "")
+        if tier:
+            tk.Label(head, text=tier, bg=HEX["bg"], fg=ARAM_TIER_COLORS.get(tier, HEX["muted"]),
+                     font=(UI_FONT, 18, "bold")).pack(side="left", padx=(0, int(8 * self.px)))
+        tk.Label(head, text=mine.get("name") or "还没选英雄", bg=HEX["bg"], fg=HEX["text"], font=(UI_FONT, 12, "bold")).pack(side="left")
+        bits = []
+        if isinstance(mine.get("rank"), (int, float)):
+            bits.append(f"第 {int(mine['rank'])}")
+        if isinstance(mine.get("win_rate"), (int, float)):
+            bits.append(f"胜率 {mine['win_rate'] * 100:.1f}%")
+        if bits:
+            tk.Label(right, text=" · ".join(bits), bg=HEX["bg"], fg=HEX["muted"], font=(UI_FONT, 9), anchor="w").pack(fill="x")
+        if mode == "game":            # 放在最上面：全屏对局里侧栏限高，放最下面会被裁掉
+            text(f"开局 {ARAM_PANEL_HIDE_AT} 秒后收起 · 按住 Tab 再看", HEX["gold"], 8, top=2)
+        balance = ((card or {}).get("champion") or {}).get("balance") or []
+        if balance:
+            text("大乱斗调整：" + "，".join(balance), HEX["muted"], 9, top=2)
+
+        if content[2]:                # 候选席：按强到弱；梯队比我手上这个高的描边亮起来
+            section("候选席")
+            flow = tk.Frame(inner, bg=HEX["bg"])
+            flow.pack(fill="x", pady=(int(2 * self.px), 0))
+            order = "SABCD"
+            my_tier = order.find(str(mine.get("tier") or "?")) if str(mine.get("tier") or "?") in order else len(order)
+            line, used = None, wrap + 1
+            for name, btier, brank, bid in content[2][:10]:
+                better = str(btier or "?") in order and order.find(str(btier)) < my_tier     # 梯队比我手上这个高才亮
+                chip = tk.Frame(flow, bg=HEX["gold_hi"] if better else HEX["line"])
+                box = tk.Frame(chip, bg=HEX["title"])
+                box.pack(padx=1, pady=1)
+                if isinstance(bid, int) and bid > 0:              # 小头像贴着左边，和这一格一样高
+                    self._icon_slot(box, bid, int(22 * self.px), HEX["btn"]).pack(side="left")
+                if btier:
+                    tk.Label(box, text=btier, bg=HEX["title"], fg=ARAM_TIER_COLORS.get(btier, HEX["muted"]),
+                             font=(UI_FONT, 9, "bold")).pack(side="left", padx=(int(5 * self.px), 0))
+                tk.Label(box, text=name or "？", bg=HEX["title"], fg=HEX["text"] if better else HEX["muted"],
+                         font=(UI_FONT, 9)).pack(side="left", padx=int(5 * self.px))
+                chip.update_idletasks()
+                need = chip.winfo_reqwidth() + int(5 * self.px)
+                if line is None or used + need > wrap:          # 这一行放不下了：另起一行
+                    line = tk.Frame(flow, bg=HEX["bg"])
+                    line.pack(fill="x", pady=(0, int(4 * self.px)))
+                    used = 0
+                chip.pack(in_=line, side="left", padx=(0, int(5 * self.px)))
+                chip.lift()
+                used += need
+
+        if mode == "game":            # 读条：AI 按这局阵容写的建议放最前面，下面才是通用的统计
+            if guide:
+                section("这局怎么打（AI）")
+                for ln in guide[:5]:
+                    text(f"{ln.get('label')}：{ln.get('text')}", top=3)
+            elif content[5]:
+                section("这局怎么打（AI 正在写）")
+                skeleton((0.9, 0.7))
+        if mine.get("name") and not card:
+            skeleton((0.5, 0.75, 0.6, 0.85))              # 攻略还在路上：先放占位条
+        elif card:
+            skills = card.get("skills") or []
+            if skills:
+                section("技能加点")
+                text(str(skills[0].get("order") or "").replace(">", " > "), size=11)
+                for extra in skills[1:2] if not compact else []:
+                    text(f"{extra.get('label')}：{str(extra.get('order') or '').replace('>', ' > ')}", HEX["muted"], 9)
+            summ = card.get("summoners") or []
+            if summ and summ[0].get("spells"):
+                section("召唤师技能")
+                text(" + ".join(summ[0]["spells"]))
+            builds = card.get("builds") or []
+            if builds and builds[0].get("items"):
+                section("出装")
+                text(" → ".join(builds[0]["items"]))
+                if builds[0].get("starter"):
+                    text("出门：" + "、".join(builds[0]["starter"]), HEX["muted"], 9)
+                late = [x.get("name") for x in card.get("late_items") or [] if x.get("name")]
+                if late and not compact:
+                    text("后续：" + "、".join(late), HEX["muted"], 9)
+            augs = card.get("augments") or []
+            if augs and not compact:
+                section("最强海克斯")
+                for a in augs[:3 if mode == "game" else 5]:
+                    row = tk.Frame(inner, bg=HEX["bg"])
+                    row.pack(fill="x")
+                    tk.Label(row, text=str(a.get("tier") or "-"), width=2, bg=HEX["bg"], anchor="w",
+                             fg=ARAM_TIER_COLORS.get(a.get("tier"), HEX["muted"]), font=(UI_FONT, 9, "bold")).pack(side="left")
+                    tk.Label(row, text=a.get("name") or "", bg=HEX["bg"], fg=HEX["text"], font=(UI_FONT, 10)).pack(side="left")
+                    if a.get("rarity_label"):
+                        tk.Label(row, text=a["rarity_label"], bg=HEX["bg"], fg=HEX["muted"], font=(UI_FONT, 9)).pack(side="left", padx=(int(6 * self.px), 0))
+        if not compact:
+            text("数据：ARAMKit", HEX["line"], 8, top=10)
+        self.fill_icons()
+        if self.skeletons:
+            self._pulse()
+
+    def _pulse(self) -> None:
+        """占位条一明一暗，表示内容正在路上"""
+        self.pulse_on = not self.pulse_on
+        for bar in self.skeletons:
+            try:
+                bar.config(bg=HEX["line"] if self.pulse_on else HEX["btn"])
+            except Exception:
+                pass
+        if self.skeletons:
+            self._later(450, self._pulse)
+
+    # --- 显示 / 收起 ---
+    def _later(self, ms: int, fn) -> None:
+        self.jobs.append(self.root.after(ms, fn))
+
+    def _hide_now(self) -> None:
+        _aram_win().SetWindowPos(self.hwnd, None, 0, 0, 0, 0, 0x0080 | 0x0001 | 0x0002 | 0x0004 | 0x0010)
+        self.shown, self.fading = None, False
+        self.show_gen += 1
+
+    def _cancel_fade(self) -> None:
+        self.fading = False
+
+    def _fade_out(self, step: int = 0) -> None:
+        if step == 0:
+            self.fading = True
+        if not self.fading:
+            return                    # 淡到一半又该显示了
+        if step >= 4:
+            self._hide_now()
+            self.win.attributes("-alpha", 0.0)
+            return
+        self.win.attributes("-alpha", max(0.0, 1.0 - (step + 1) * 0.25))
+        self.root.after(30, lambda: self._fade_out(step + 1))
+
+    def _watch(self) -> None:
+        """每 200 毫秒看一眼：客户端 / 游戏窗口挪了就跟过去，切走了就收起，回来了再出来"""
+        try:
+            target = self._target()
+            if target != self.shown and not (target is None and self.shown is None):
+                self._update()
+        except Exception as e:
+            logger.debug(f"攻略侧栏出错: {e}")
+        self.root.after(200, self._watch)
+
+    def _watch_key(self) -> None:
+        """这一局有攻略时，每 40 毫秒看一眼 Tab 是不是按着：按下去侧栏出来，松开收起。
+        同时按着 Alt 的不算（那是在切窗口）；游戏不在最前面时 _target 本来就不让显示"""
+        wait = 300
+        try:
+            peek = False
+            if self._has_guide():
+                wait = 40
+                w = _aram_win()
+                peek = bool(w.GetAsyncKeyState(ARAM_PEEK_VK) & 0x8000) and not w.GetAsyncKeyState(0x12) & 0x8000
+            if peek != self.peek:
+                self.peek = peek
+                self._update()
+        except Exception as e:
+            logger.debug(f"攻略侧栏（Tab）出错: {e}")
+        self.root.after(wait, self._watch_key)
+
+
 class CompanionWindow:
     def __init__(self, companion, keeper: LocaleKeeper, worker: threading.Thread, log_q):
         import tkinter as tk
@@ -1670,12 +3596,20 @@ class CompanionWindow:
         self.px = max(1.0, root.winfo_fpixels("1i") / 96)
         root.title(f"托子的小警察 v{VERSION}")
         root.configure(bg=HEX["bg"])
-        root.minsize(int(380 * self.px), int(430 * self.px))
-        root.geometry(f"{int(400 * self.px)}x{int(445 * self.px)}")
+        root.minsize(int(380 * self.px), int(465 * self.px))
+        root.geometry(f"{int(400 * self.px)}x{int(480 * self.px)}")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._dark_title_bar()
         self._set_icon()
         self._build()
+        self.overlay = None
+        if self.aram is not None:
+            try:
+                self.overlay = AramOverlay(root, self.aram)        # 海克斯助手的标注层（平时看不见）
+                self.overlay.panel = AramPanel(root, self.aram, self.px)   # 选人梯队 + 英雄攻略的侧栏
+                self.overlay.badges = LoadingBadges(root, self.aram)       # 读条界面上的十人战绩标签
+            except Exception as e:
+                logger.warning(f"海克斯助手的标注层打不开，这次用不了: {e}")
         root.after(100, self._tick_logs)
         root.after(300, self._tick_state)
 
@@ -1788,6 +3722,42 @@ class CompanionWindow:
             for w in (acc, self.acc_box, acc_lbl):
                 w.bind("<Button-1>", lambda e: self.toggle_accept())
 
+        # 海克斯助手：同样的勾选框
+        self.aram = getattr(self.companion, "aram", None)
+        if self.aram is not None:
+            hx = tk.Frame(body, bg=HEX["bg"], cursor="hand2")
+            hx.pack(fill="x", pady=(self._p(10), 0))
+            self.aram_box = tk.Label(hx, text="✓" if self.aram.enabled else "", width=2, bg=HEX["bg"], fg=HEX["gold"],
+                                     font=(UI_FONT, 9, "bold"), highlightthickness=1,
+                                     highlightbackground=HEX["gold"], highlightcolor=HEX["gold"])
+            self.aram_box.pack(side="left")
+            hx_lbl = tk.Label(hx, text="海克斯助手", bg=HEX["bg"], fg=HEX["text"], font=(UI_FONT, 11))
+            hx_lbl.pack(side="left", padx=(self._p(8), 0))
+            for w in (self.aram_box, hx_lbl):
+                w.bind("<Button-1>", lambda e: self.toggle_aram())
+            # 细项：点一下在下面展开几个小勾选框（缩进一格），再点收起；窗口跟着变高 / 变矮
+            self.aram_more = tk.Label(hx, text="细项 ▸", bg=HEX["bg"], fg=HEX["muted"], font=(UI_FONT, 9), cursor="hand2")
+            self.aram_more.pack(side="right")
+            self.aram_more.bind("<Button-1>", lambda e: self.toggle_aram_menu())
+            self.aram_more.bind("<Enter>", lambda e: self.aram_more.config(fg=HEX["gold"]))
+            self.aram_more.bind("<Leave>", lambda e: self.aram_more.config(fg=HEX["muted"]))
+            self.aram_row = hx
+            self.aram_open = False
+            self.aram_sub = tk.Frame(body, bg=HEX["bg"])
+            self.aram_sub_rows = {}
+            for key, label in ARAM_OPTIONS:
+                row = tk.Frame(self.aram_sub, bg=HEX["bg"], cursor="hand2")
+                row.pack(fill="x", pady=(self._p(7), 0), padx=(self._p(30), 0))
+                box = tk.Label(row, text="", width=2, bg=HEX["bg"], fg=HEX["gold"], font=(UI_FONT, 7, "bold"),
+                               highlightthickness=1, highlightbackground=HEX["line"], highlightcolor=HEX["line"])
+                box.pack(side="left")
+                lbl = tk.Label(row, text=label, bg=HEX["bg"], fg=HEX["text"], font=(UI_FONT, 10))
+                lbl.pack(side="left", padx=(self._p(8), 0))
+                for w in (row, box, lbl):
+                    w.bind("<Button-1>", lambda e, k=key: self.toggle_aram_option(k))
+                self.aram_sub_rows[key] = (box, lbl)
+            self._refresh_aram_sub()
+
         # 大按钮：金色描边。鼠标移上去描边变亮、底色提一点；按下去底色压暗；点完 8 秒内显示「启动中…」
         self.btn_frame = tk.Frame(body, bg=HEX["gold"], cursor="hand2")
         self.btn_frame.pack(fill="x", pady=(self._p(16), 0))
@@ -1871,6 +3841,52 @@ class CompanionWindow:
         on = not self.accepter.enabled
         self.acc_box.config(text="✓" if on else "")
         threading.Thread(target=self.accepter.set_enabled, args=(on,), daemon=True).start()
+
+    def _refresh_aram_sub(self):
+        """细项的勾和颜色：总开关关着时细项都变灰（勾还留着，表示重新打开后会恢复成这样）"""
+        master = self.aram.enabled
+        for key, (box, lbl) in self.aram_sub_rows.items():
+            on = self.aram.option(key)
+            box.config(text="✓" if on else "", fg=HEX["gold"] if master else HEX["line"],
+                       highlightbackground=HEX["gold"] if master and on else HEX["line"])
+            lbl.config(fg=HEX["text"] if master else HEX["muted"])
+
+    def toggle_aram_option(self, key):
+        if not self.aram.enabled:
+            self.hint_override = ("先把上面的「海克斯助手」勾上", time.time() + 3)
+            return
+        on = not self.aram.option(key)
+        self.aram.config[key] = on                    # 先改内存里的，勾马上变；写文件放后台
+        self._refresh_aram_sub()
+        threading.Thread(target=self.aram.set_option, args=(key, on), daemon=True).start()
+
+    def toggle_aram_menu(self):
+        """展开 / 收起细项。窗口高度分 4 步、约 120 毫秒变到位，细项在窗口开始变高时就出现"""
+        self.aram_open = not self.aram_open
+        self.aram_more.config(text="细项 ▾" if self.aram_open else "细项 ▸")
+        root = self.root
+        root.update_idletasks()
+        if self.aram_open:
+            self.aram_sub.pack(fill="x", after=self.aram_row)
+            root.update_idletasks()
+        delta = self.aram_sub.winfo_reqheight() * (1 if self.aram_open else -1)
+        if not self.aram_open:
+            self.aram_sub.pack_forget()
+        width, height = root.winfo_width(), root.winfo_height()
+        min_w = int(380 * self.px)
+        base_min = int(465 * self.px)
+        root.minsize(min_w, base_min + (self.aram_sub.winfo_reqheight() if self.aram_open else 0))
+        for step in range(1, 5):
+            root.after(step * 30, lambda s=step: root.geometry(f"{width}x{max(base_min, height + delta * s // 4)}"))
+
+    def toggle_aram(self):
+        on = not self.aram.enabled
+        self.aram_box.config(text="✓" if on else "")
+        self.aram.config["aram_helper"] = on          # 细项的灰 / 亮马上跟着变
+        self._refresh_aram_sub()
+        self.hint_override = (f"游戏要用无边框模式；没自动出来可以按 {self.aram.hotkey_name}" if on
+                              else "海克斯助手已关闭", time.time() + 5)
+        threading.Thread(target=self.aram.set_enabled, args=(on,), daemon=True).start()
 
     def toggle_zh(self):
         """勾选框马上变，改文件和查客户端进程放后台（查进程要一两百毫秒，别让窗口卡一下）"""
@@ -2025,7 +4041,7 @@ def main() -> int:
     # 必须无条件覆盖并写回，否则搬家之后他们的插件会一直连不上
     if config.get("server") != SERVER_URL:
         if config.get("server"):
-            logger.info(f"机器人地址已更新：{config['server']} → {SERVER_URL}")
+            logger.info(f"机器人地址已更新为 {SERVER_URL}")
         config["server"] = SERVER_URL
 
     if not config.get("token"):
@@ -2064,6 +4080,11 @@ def main() -> int:
     companion.accepter = AutoAccepter(config, companion)
     if companion.accepter.enabled:
         logger.info("自动接受对局已开启")
+    if IS_WINDOWS and not args.no_gui:      # 海克斯助手要靠窗口线程画标注，纯命令行模式没有
+        try:
+            companion.aram = AramAssistant(config, companion, bot)
+        except Exception as e:
+            logger.warning(f"海克斯助手启动失败，这次用不了: {e}")
     if keeper.enabled:
         logger.info(f"简中汉化已开启（{keeper.status()}）")
     try:
