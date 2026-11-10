@@ -46,7 +46,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.9.1"
+VERSION = "1.9.2"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -1814,6 +1814,50 @@ def _aram_win():
     return _ARAM_WIN
 
 
+def process_elevated(pid: int) -> bool | None:
+    """这个进程是不是以管理员身份在跑。True / False；查不了（多半就是因为它权限比我们高）返回 None"""
+    import ctypes
+    from ctypes import wintypes
+    k, a = ctypes.WinDLL("kernel32", use_last_error=True), ctypes.WinDLL("advapi32", use_last_error=True)
+    k.OpenProcess.restype, k.OpenProcess.argtypes = wintypes.HANDLE, [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    a.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    a.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    handle = k.OpenProcess(0x1000, False, int(pid))           # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        token = wintypes.HANDLE()
+        if not a.OpenProcessToken(handle, 0x0008, ctypes.byref(token)):      # TOKEN_QUERY
+            return None
+        try:
+            value, size = wintypes.DWORD(0), wintypes.DWORD(0)
+            if not a.GetTokenInformation(token, 20, ctypes.byref(value), 4, ctypes.byref(size)):   # TokenElevation
+                return None
+            return bool(value.value)
+        finally:
+            k.CloseHandle(token)
+    finally:
+        k.CloseHandle(handle)
+
+
+def game_blocks_keys() -> bool:
+    """游戏是不是以比插件高的权限在跑。是的话，游戏窗口在最前面时系统不让插件看到按键（按住 Tab 就没反应）"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        hwnd = find_game_window()
+        if not hwnd or process_elevated(os.getpid()) is not False:
+            return False                                  # 没在对局里，或者插件自己就是管理员权限：没这个问题
+        pid = wintypes.DWORD(0)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return bool(pid.value) and process_elevated(pid.value) is not False
+    except Exception:
+        return False
+
+
 def find_game_window() -> int:
     """对局的游戏窗口（不是大厅）。没在对局里就是 0"""
     return int(_aram_win().FindWindowW("RiotWindowClass", "League of Legends (TM) Client") or 0)
@@ -2278,6 +2322,7 @@ ARAM_PEEK_VK = 0x09             # 收起以后按住这个键（Tab，也就是�
 ARAM_PICK_LEVELS = (1, 7, 11, 15, 21)
 ARAM_PICK_MAX = 5               # 一局最多能选几次：普通的四次 + 嘉宾带来的一次（21 级那次，或者 KDA 额外的那次）
 ARAM_FOUNTAIN_GRACE = 30        # 复活以后这么多秒内当作人还在泉水（这时升到对应等级，卡片也会出来）
+ARAM_CARD_RETRY_WAITS = (4, 10, 20, 40)    # 英雄攻略卡没取到（机器人刚重启时很慢、会超时）：隔这么多秒再试，一共试 5 次
 ARAM_PICK_CONFIRM_SECONDS = 60  # 标注过的卡片消失了这么久才算「这一次选完了」（玩家可以把卡片收起来再打开，消失不等于选完）
 ARAM_FIRST_PICK_SECONDS = 180   # 开局第一次：从这局第一次问到等级算起，这么久内只要还没选就一直找（之后还没认到过，就不再为它一直截了）
 # 海克斯助手下面的细项开关：(配置文件里的键, 窗口上的字)。都默认开；总开关关掉时全部不工作
@@ -2865,11 +2910,28 @@ class AramAssistant:
                 publish()
 
         def card():
-            try:
-                data["card"] = self.champion_card(info["champion_id"])
-                publish()
-            except Exception as e:
-                logger.debug(f"英雄攻略：{e}")
+            # 以前只取一次：机器人刚重启时慢、请求超时，这一局的侧栏就整局都没内容，按住 Tab 也没反应
+            champion_id = info["champion_id"]
+            for attempt, wait in enumerate((0, *ARAM_CARD_RETRY_WAITS)):
+                if wait:
+                    time.sleep(wait)
+                    self._cards.pop(champion_id, None)      # 上一次没取到的记录清掉，不然一分钟内不会真的去问
+                if self.prepared_game != game_id:
+                    return                                  # 这局已经结束了
+                try:
+                    got = self.champion_card(champion_id)
+                except Exception as e:
+                    logger.debug(f"英雄攻略：{e}")
+                    got = None
+                if got:
+                    data["card"] = got
+                    publish()
+                    if attempt:
+                        logger.info(f"海克斯助手：英雄攻略取到了（第 {attempt + 1} 次才成功），侧栏和按住 Tab 可以用了")
+                    return
+            data["card_failed"] = True
+            publish()
+            logger.info("海克斯助手：这局的英雄攻略一直没取到（机器人没回应），侧栏和按住 Tab 这局没有内容可显示；三选一的标注不受影响")
 
         threading.Thread(target=players, daemon=True, name="aram-players").start()
         if data["mayhem"] and info.get("champion_id") and self.enabled and self.option("aram_local_ocr"):
@@ -3912,6 +3974,8 @@ class AramPanel:
         self.pregame_at = 0.0         # 这一局的读条数据是什么时候来的（太久了也收起，防止一直挂着）
         self.peek = False             # 现在是不是按着 Tab（收起以后按住再看一眼）
         self.picking = False          # 三选一的标注现在是不是显示着（是的话侧栏显示海克斯那一页）
+        self.tab_noted = None         # 哪一局已经在日志里说过「按了 Tab」了（一局只说一次）
+        self.keys_checked = None      # 哪一局已经查过「游戏的权限是不是比插件高」了
         self.icons: dict = {}         # (英雄编号, 边长) -> 缩好的头像图；None = 这张图解不开，不再试
         self.icon_slots: list = []    # 现在画面上还在等头像的位置：(英雄编号, 边长, 那个 Label)
         self.show_gen = 0             # 第几次「滑进来」：收起 / 淡出以后，上一次滑进来剩下的几步就不走了
@@ -4453,15 +4517,30 @@ class AramPanel:
         self.root.after(200, self._watch)
 
     def _watch_key(self) -> None:
-        """这一局有攻略时，每 40 毫秒看一眼 Tab 是不是按着：按下去侧栏出来，松开收起。
+        """海克斯大乱斗对局里，每 40 毫秒看一眼 Tab 是不是按着：按下去侧栏出来，松开收起。
         同时按着 Alt 的不算（那是在切窗口）；游戏不在最前面时 _target 本来就不让显示"""
         wait = 300
         try:
             peek = False
-            if self._has_guide():
+            game = (self.pregame or {}).get("game_id") if (self.pregame or {}).get("mayhem") else None
+            if game is not None:
                 wait = 40
                 w = _aram_win()
-                peek = bool(w.GetAsyncKeyState(ARAM_PEEK_VK) & 0x8000) and not w.GetAsyncKeyState(0x12) & 0x8000
+                down = bool(w.GetAsyncKeyState(ARAM_PEEK_VK) & 0x8000) and not w.GetAsyncKeyState(0x12) & 0x8000
+                if game != self.keys_checked and find_game_window():
+                    self.keys_checked = game
+                    if game_blocks_keys():
+                        logger.warning("海克斯助手：游戏是用管理员身份运行的，插件是普通权限，系统不让插件看到按键："
+                                       "按住 Tab 看出装会没有反应。右键插件选「以管理员身份运行」就可以了（三选一的标注和侧栏不受影响）")
+                if down and game != self.tab_noted and game_layout():
+                    self.tab_noted = game             # 这一局第一次在游戏里按 Tab：记一行，出了问题好查
+                    if self._has_guide():
+                        logger.info("海克斯助手：按住 Tab，显示出装页（松开收起）")
+                    elif self.pregame.get("card_failed"):
+                        logger.info("海克斯助手：按了 Tab，但这局的英雄攻略没取到，没有内容可显示")
+                    else:
+                        logger.info("海克斯助手：按了 Tab，但这局的英雄攻略还没取到（或者攻略侧栏在细项里关掉了），没有内容可显示")
+                peek = down and self._has_guide()
             if peek != self.peek:
                 self.peek = peek
                 self._update()
