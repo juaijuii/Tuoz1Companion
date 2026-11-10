@@ -48,7 +48,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.9.5"
+VERSION = "1.9.6"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -711,6 +711,139 @@ def check_for_update(enabled: bool = True) -> bool:
         logger.error(f"启动新版本失败，请手动双击 {exe.name}: {e}")
         return False
     return True
+
+
+# ----------------------------------------------------------------------------
+# 桌面快捷方式：很多人把 exe 下到「下载」文件夹里，下次就找不到了
+# ----------------------------------------------------------------------------
+SHORTCUT_NAME = "托子的小警察"       # 和窗口标题一样
+
+
+def _guid(text: str):
+    """"{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}" -> 系统接口要的那种 16 字节结构"""
+    import ctypes
+    import uuid
+    return (ctypes.c_ubyte * 16).from_buffer_copy(uuid.UUID(text).bytes_le)
+
+
+def _com_call(obj, index: int, *args, argtypes=(), restype=None):
+    """调用一个 COM 对象的第 index 个方法（失败时抛 OSError）"""
+    import ctypes
+    table = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+    proto = ctypes.WINFUNCTYPE(restype or ctypes.HRESULT, ctypes.c_void_p, *argtypes)
+    return proto(table[index])(obj, *args)
+
+
+def _shell_link(job):
+    """开一个系统的「快捷方式」对象，交给 job(快捷方式对象, 它的存取接口) 去用，用完收拾干净"""
+    import ctypes
+    ole32 = ctypes.WinDLL("ole32")
+    ole32.CoInitialize.argtypes = [ctypes.c_void_p]
+    ole32.CoCreateInstance.restype = ctypes.HRESULT
+    ole32.CoCreateInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p,
+                                       ctypes.POINTER(ctypes.c_void_p)]
+    started = ole32.CoInitialize(None) in (0, 1)
+    link, store = ctypes.c_void_p(), ctypes.c_void_p()
+    try:
+        ole32.CoCreateInstance(_guid("{00021401-0000-0000-C000-000000000046}"), None, 1,                  # ShellLink
+                               _guid("{000214F9-0000-0000-C000-000000000046}"), ctypes.byref(link))       # IShellLinkW
+        _com_call(link, 0, _guid("{0000010b-0000-0000-C000-000000000046}"), ctypes.byref(store),          # IPersistFile
+                  argtypes=(ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)))
+        return job(link, store)
+    finally:
+        for obj in (store, link):
+            if obj:
+                _com_call(obj, 2, restype=ctypes.c_ulong)                                                 # Release
+        if started:
+            ole32.CoUninitialize()
+
+
+def write_shortcut(lnk: Path, target: Path, description: str = "") -> None:
+    """在 lnk 这个位置建（或改写）一个指向 target 的快捷方式。图标用 target 自己的"""
+    import ctypes
+    from ctypes import wintypes
+
+    def job(link, store):
+        _com_call(link, 20, str(target), argtypes=(ctypes.c_wchar_p,))                    # SetPath
+        _com_call(link, 9, str(target.parent), argtypes=(ctypes.c_wchar_p,))              # SetWorkingDirectory
+        if description:
+            _com_call(link, 7, description, argtypes=(ctypes.c_wchar_p,))                 # SetDescription
+        _com_call(store, 6, str(lnk), True, argtypes=(ctypes.c_wchar_p, wintypes.BOOL))   # Save
+    _shell_link(job)
+
+
+def read_shortcut(lnk: Path) -> str:
+    """一个快捷方式指向哪个文件；读不了返回空串"""
+    import ctypes
+    from ctypes import wintypes
+
+    def job(link, store):
+        _com_call(store, 5, str(lnk), 0, argtypes=(ctypes.c_wchar_p, wintypes.DWORD))     # Load
+        buf = ctypes.create_unicode_buffer(1024)
+        _com_call(link, 3, buf, 1024, None, 0,                                            # GetPath
+                  argtypes=(ctypes.c_wchar_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD))
+        return buf.value
+    try:
+        return _shell_link(job) or ""
+    except Exception:
+        return ""
+
+
+def desktop_dir() -> Path | None:
+    """这个用户的桌面文件夹（桌面被 OneDrive 接管、挪到别的盘时也能找对）"""
+    import ctypes
+    try:
+        shell32, ole32 = ctypes.WinDLL("shell32"), ctypes.WinDLL("ole32")
+        shell32.SHGetKnownFolderPath.restype = ctypes.HRESULT
+        shell32.SHGetKnownFolderPath.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+        raw = ctypes.c_void_p()
+        shell32.SHGetKnownFolderPath(_guid("{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}"), 0, None, ctypes.byref(raw))
+        try:
+            path = Path(ctypes.wstring_at(raw.value))
+        finally:
+            ole32.CoTaskMemFree(raw)
+        return path if path.is_dir() else None
+    except Exception:
+        fallback = Path.home() / "Desktop"
+        return fallback if fallback.is_dir() else None
+
+
+def ensure_desktop_shortcut(config: dict, exe: Path | None = None, desktop: Path | None = None) -> str:
+    """第一次从某个位置运行时，在桌面建一个指向自己的快捷方式。返回做了什么：off / kept / on_desktop / made / failed。
+
+    每个位置只建一次（记在配置里的 desktop_shortcut_for）：玩家自己把快捷方式删了，不会每次打开又冒出来；
+    exe 挪了地方再打开，桌面上那个会改成指向新位置。配置里 "desktop_shortcut": false 可以关掉。
+    要在申请管理员权限之前做：用别的管理员账号提权的话，提权之后的「桌面」是那个管理员的桌面"""
+    if exe is None:
+        if not (IS_WINDOWS and IS_FROZEN):
+            return "off"                              # 源码运行：没有 exe 可指
+        exe = Path(sys.executable).resolve()
+    if config.get("desktop_shortcut", True) is False:
+        return "off"
+    here = os.path.normcase(str(exe))
+    if os.path.normcase(str(config.get("desktop_shortcut_for") or "")) == here:
+        return "kept"
+    try:
+        desktop = desktop or desktop_dir()
+        if desktop is None:
+            return "failed"
+        if os.path.normcase(str(exe.parent)) == os.path.normcase(str(desktop)):
+            result = "on_desktop"                     # exe 本来就放在桌面上：用不着快捷方式
+        else:
+            lnk = desktop / f"{SHORTCUT_NAME}.lnk"
+            write_shortcut(lnk, exe, "Tuoz1 Bot 客户端插件")
+            if os.path.normcase(read_shortcut(lnk)) != here:
+                raise OSError("快捷方式写出来了，但读回来指向的不是插件")
+            result = "made"
+            logger.info(f"已经在桌面放了一个快捷方式「{SHORTCUT_NAME}」，以后从桌面打开就行（插件本体在 {exe.parent}，别删）。"
+                        "不想要可以直接删掉，不会再生成")
+        config["desktop_shortcut_for"] = str(exe)
+        save_config(config)
+        return result
+    except Exception as e:
+        logger.debug(f"建桌面快捷方式失败: {e}")
+        return "failed"
 
 
 # ----------------------------------------------------------------------------
@@ -2529,6 +2662,7 @@ ARAM_PEEK_VK = 0x09             # 收起以后按住这个键（Tab，也就是�
 ARAM_PICK_LEVELS = (1, 7, 11, 15, 21)
 ARAM_PICK_MAX = 5               # 一局最多能选几次：普通的四次 + 嘉宾带来的一次（21 级那次，或者 KDA 额外的那次）
 ARAM_FOUNTAIN_GRACE = 30        # 复活以后这么多秒内当作人还在泉水（这时升到对应等级，卡片也会出来）
+ARAM_LOADED_AT = 1.0            # 游戏里的时间走到这么多秒才算读条结束（自己加载完、等别人的时候时间停在 0）
 ARAM_GUIDE_MIN_ENEMIES = 3      # 对面至少这么多人才写 AI 建议（和机器人那边的规矩一样）：一个人的自定义对局没有阵容可分析
 ARAM_INPUT_KEYS = (0x01, 0x02, 0x09, 0x20, 0x51, 0x57, 0x45, 0x52, 0x44, 0x46)   # 鼠标左右键、Tab、空格、Q W E R D F
 ARAM_INPUT_QUIET_SECONDS = 120  # 对局里游戏在最前面累计这么久、上面这些键一次都没看到：多半是系统不让插件看按键
@@ -3226,12 +3360,17 @@ class AramAssistant:
             threading.Thread(target=guide, daemon=True, name="aram-guide").start()     # AI 最慢，最先出发
         if want_panel:
             threading.Thread(target=card, daemon=True, name="aram-card").start()
-        loaded, deadline = False, time.time() + 900
+        loaded, answered, deadline = False, None, time.time() + 900
         while self.prepared_game == game_id and time.time() < deadline:
             seconds = live_clock(lcu)
-            if seconds is not None and not loaded:
+            if seconds is not None and answered is None:
+                answered = time.time()                # 游戏的接口开始有回应了 = 我这台电脑加载完了（别人可能还没）
+            # 游戏的接口有回应不等于读条结束：自己加载完了、还在等别人的时候它就有回应了，只是游戏里的时间还停在 0。
+            # 以前一有回应就当读条结束，电脑快的人战绩标签闪一下就没了。要等游戏里的时间真的走起来才算
+            if seconds is not None and seconds >= ARAM_LOADED_AT and not loaded:
                 loaded = True
                 self.events.put(("loaded", game_id))
+                logger.info(f"读条结束，游戏开始了（游戏内时间 {seconds:.0f} 秒；自己加载完以后又等了别人 {time.time() - answered:.0f} 秒）")
             if seconds is not None and seconds >= ARAM_PANEL_HIDE_AT:
                 self.started_game = game_id
                 self.events.put(("started", game_id))
@@ -4180,6 +4319,10 @@ class LoadingBadges:
             if want or self.layout is not None:
                 if (game_layout() if want else None) != self.layout:
                     self._update()
+                elif self.layout is not None and not self.fading:
+                    # 位置没变也把自己重新放到最上面一次（不动位置、不抢焦点）：读条刚开始时游戏窗口还在初始化，
+                    # 可能把自己提到我们上面，标签就被盖住了
+                    _aram_win().SetWindowPos(self.hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
         except Exception as e:
             logger.debug(f"战绩标签出错: {e}")
         self.root.after(250, self._watch)
@@ -5319,6 +5462,7 @@ def main() -> int:
 
     setup_logging(args.verbose)
     logger.info(f"{APP_NAME} v{VERSION} — Tuoz1 Bot 客户端插件  (配置: {CONFIG_PATH})")
+    ensure_desktop_shortcut(load_config())
     if ensure_elevated(args):
         return 0
     cleanup_old_binary()
