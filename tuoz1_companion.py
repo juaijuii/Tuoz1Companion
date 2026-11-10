@@ -48,7 +48,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.9.3"
+VERSION = "1.9.4"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -701,6 +701,128 @@ def check_for_update(enabled: bool = True) -> bool:
         logger.error(f"启动新版本失败，请手动双击 {exe.name}: {e}")
         return False
     return True
+
+
+# ----------------------------------------------------------------------------
+# 管理员权限：游戏通常是以管理员身份在跑，插件权限比它低的话系统不让插件看到按键（按住 Tab 看出装就没反应）
+# ----------------------------------------------------------------------------
+ELEVATE_LINGER_SECONDS = 6      # 申请到权限、开出管理员身份的自己以后，原来这个进程再留这么久才退出（比自动更新盯的 3 秒长）
+
+
+def relaunch_elevated(argv: list) -> str:
+    """让 Windows 以管理员身份再开一个自己（会弹一次系统的确认框）。
+    返回 started（开出来了，这个进程该退出）/ declined（确认框点了「否」）/ failed"""
+    import ctypes
+    from ctypes import wintypes
+    # 和自动更新重启时一样：PyInstaller 留在环境里的变量万一被新进程继承，它会去用我们这个进程解包出来的临时目录，
+    # 而那个目录在我们退出时就删了
+    for key in list(os.environ):
+        if key.startswith("_PYI_") or key == "_MEIPASS2":
+            os.environ.pop(key, None)
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.ShellExecuteW.restype = ctypes.c_void_p
+    shell32.ShellExecuteW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                      wintypes.LPCWSTR, ctypes.c_int]
+    rc = shell32.ShellExecuteW(None, "runas", sys.executable, subprocess.list2cmdline(argv), str(APP_DIR), 1) or 0
+    if rc > 32:
+        return "started"
+    return "declined" if rc == 5 or ctypes.get_last_error() == 1223 else "failed"
+
+
+def ensure_elevated(args) -> bool:
+    """插件不是管理员身份时，申请一次。返回 True = 已经另开了一个管理员身份的自己，这个进程该退出了。
+
+    为什么不直接在 exe 上写死「必须管理员」：旧版本自动更新完是用普通方式启动新版本的，exe 写死的话那一步会直接失败；
+    而且确认框点了「否」、或者这个账号根本不是管理员时，插件就完全打不开了。这样做的话拿不到权限也照常运行，只是 Tab 可能没反应。
+    不申请的情况：源码运行、已经是管理员、这就是申请之后开出来的那个（--elevated，防止来回重开）、
+    拖文件导入黑名单、命令行加了 --no-elevate、配置文件里 "run_as_admin": false"""
+    if not (IS_WINDOWS and IS_FROZEN) or args.no_elevate or args.elevated or args.import_blacklist or args.file:
+        return False
+    try:
+        if load_config().get("run_as_admin", True) is False or process_elevated(os.getpid()) is not False:
+            return False
+        logger.info("正在申请管理员权限，Windows 会弹一次确认框，点「是」就行。原因：游戏通常以管理员身份运行，"
+                    "插件权限比它低的话系统不让插件看到按键，对局里按住 Tab 看出装会没有反应")
+        result = relaunch_elevated(sys.argv[1:] + ["--elevated"])
+    except Exception as e:
+        logger.debug(f"申请管理员权限出错: {e}")
+        result = "failed"
+    if result == "started":
+        # 别马上退出：旧版本自动更新完会盯新版本 3 秒，看到它退出了就以为没启动成功、会再开一个出来。
+        # 这几秒把自己的黑窗口藏起来（管理员身份的那个有它自己的窗口）
+        show_console(False)
+        time.sleep(ELEVATE_LINGER_SECONDS)
+        return True
+    logger.warning("没有拿到管理员权限（确认框点了「否」，或者这个账号不是管理员）。插件照常运行，只是对局里按住 Tab 看出装可能没有反应。"
+                   "不想每次被问：在 companion_config.json 里加一行 \"run_as_admin\": false")
+    return False
+
+
+def spawn_unelevated(cmd: list) -> bool:
+    """插件自己是管理员身份时，用普通权限去开别的程序（借桌面那个资源管理器进程的身份）。成功返回 True。
+    用在「英雄联盟，启动！」上：不这样的话游戏会跟着插件变成管理员身份，别的普通权限的程序（比如 Discord 的按键说话）
+    在游戏里就收不到按键了"""
+    import ctypes
+    from ctypes import wintypes
+
+    class STARTUPINFOW(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR), ("lpDesktop", wintypes.LPWSTR),
+                    ("lpTitle", wintypes.LPWSTR), ("dwX", wintypes.DWORD), ("dwY", wintypes.DWORD),
+                    ("dwXSize", wintypes.DWORD), ("dwYSize", wintypes.DWORD), ("dwXCountChars", wintypes.DWORD),
+                    ("dwYCountChars", wintypes.DWORD), ("dwFillAttribute", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                    ("wShowWindow", wintypes.WORD), ("cbReserved2", wintypes.WORD), ("lpReserved2", ctypes.c_void_p),
+                    ("hStdInput", wintypes.HANDLE), ("hStdOutput", wintypes.HANDLE), ("hStdError", wintypes.HANDLE)]
+
+    class PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [("hProcess", wintypes.HANDLE), ("hThread", wintypes.HANDLE),
+                    ("dwProcessId", wintypes.DWORD), ("dwThreadId", wintypes.DWORD)]
+
+    u = ctypes.WinDLL("user32", use_last_error=True)
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    a = ctypes.WinDLL("advapi32", use_last_error=True)
+    u.GetShellWindow.restype = wintypes.HWND
+    u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    k.OpenProcess.restype, k.OpenProcess.argtypes = wintypes.HANDLE, [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    a.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    a.DuplicateTokenEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                   ctypes.POINTER(wintypes.HANDLE)]
+    a.CreateProcessWithTokenW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPWSTR,
+                                          wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR,
+                                          ctypes.POINTER(STARTUPINFOW), ctypes.POINTER(PROCESS_INFORMATION)]
+    handles = []
+    try:
+        pid = wintypes.DWORD(0)
+        shell = u.GetShellWindow()
+        if not shell or not u.GetWindowThreadProcessId(shell, ctypes.byref(pid)) or not pid.value:
+            return False
+        proc = k.OpenProcess(0x0400, False, pid.value)                 # PROCESS_QUERY_INFORMATION
+        if not proc:
+            return False
+        handles.append(proc)
+        token = wintypes.HANDLE()
+        if not a.OpenProcessToken(proc, 0x0002, ctypes.byref(token)):  # TOKEN_DUPLICATE
+            return False
+        handles.append(token)
+        primary = wintypes.HANDLE()
+        # TOKEN_QUERY | ASSIGN_PRIMARY | DUPLICATE | ADJUST_DEFAULT | ADJUST_SESSIONID；SecurityImpersonation；TokenPrimary
+        if not a.DuplicateTokenEx(token, 0x018B, None, 2, 1, ctypes.byref(primary)):
+            return False
+        handles.append(primary)
+        si, pi = STARTUPINFOW(), PROCESS_INFORMATION()
+        si.cb = ctypes.sizeof(si)
+        line = ctypes.create_unicode_buffer(subprocess.list2cmdline([str(c) for c in cmd]))
+        if not a.CreateProcessWithTokenW(primary, 0, None, line, 0x00000200, None, str(Path(str(cmd[0])).parent),
+                                         ctypes.byref(si), ctypes.byref(pi)):      # CREATE_NEW_PROCESS_GROUP
+            return False
+        handles.extend((pi.hProcess, pi.hThread))
+        return True
+    except Exception as e:
+        logger.debug(f"用普通权限启动失败: {e}")
+        return False
+    finally:
+        for h in handles:
+            k.CloseHandle(h)
 
 
 # ----------------------------------------------------------------------------
@@ -1659,9 +1781,12 @@ def launch_lol() -> str:
     exe = find_riot_client()
     if exe is None:
         return "没找到 Riot 客户端，请用平时的方式打开游戏"
-    flags = 0x00000008 | 0x00000200 if IS_WINDOWS else 0       # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen([str(exe), "--launch-product=league_of_legends", "--launch-patchline=live"],
-                     close_fds=True, creationflags=flags)
+    cmd = [str(exe), "--launch-product=league_of_legends", "--launch-patchline=live"]
+    # 插件现在通常是管理员身份：游戏不要跟着变成管理员身份，用普通权限去开；这条路走不通再照老办法开
+    plain = bool(IS_WINDOWS and process_elevated(os.getpid()) is True and spawn_unelevated(cmd))
+    if not plain:
+        flags = 0x00000008 | 0x00000200 if IS_WINDOWS else 0   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        subprocess.Popen(cmd, close_fds=True, creationflags=flags)
     logger.info(f"英雄联盟，启动！（{exe}）")
     return "正在打开英雄联盟…"
 
@@ -4368,9 +4493,7 @@ class AramPanel:
         if mode == "game":            # 放在最上面：全屏对局里侧栏限高，放最下面会被裁掉
             text({"augments": "选海克斯时自动显示 · 选完收起", "build": "出装 · 松开 Tab 收起"}.get(
                 page, f"开局 {ARAM_PANEL_HIDE_AT} 秒后收起 · 按住 Tab 看出装"), HEX["gold"], 8, top=2)
-        balance = ((card or {}).get("champion") or {}).get("balance") or []
-        if balance:
-            text("大乱斗调整：" + "，".join(balance), HEX["muted"], 9, top=2)
+        # 「大乱斗调整」（伤害 +5% 之类）不显示：那是普通大乱斗的平衡补丁，海克斯大乱斗里不生效
 
         if content[2]:                # 候选席：按强到弱；梯队比我手上这个高的描边亮起来
             section("候选席")
@@ -5109,6 +5232,8 @@ def main() -> int:
     parser.add_argument("file", nargs="?", help=argparse.SUPPRESS)   # 把文件拖到 exe 上时，路径就在这里
     parser.add_argument("--no-gui", action="store_true", help="不开窗口，只用命令行")
     parser.add_argument("--ocr-selftest", action="store_true", help="检查本机认字能不能用（模型和运行库在不在），然后退出")
+    parser.add_argument("--no-elevate", action="store_true", help="启动时不申请管理员权限（对局里按住 Tab 看出装可能没反应）")
+    parser.add_argument("--elevated", action="store_true", help=argparse.SUPPRESS)    # 申请权限之后开出来的那个自己带着它
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -5117,6 +5242,8 @@ def main() -> int:
 
     setup_logging(args.verbose)
     logger.info(f"{APP_NAME} v{VERSION} — Tuoz1 Bot 客户端插件  (配置: {CONFIG_PATH})")
+    if ensure_elevated(args):
+        return 0
     cleanup_old_binary()
     if check_for_update(not args.no_update):
         return 0
