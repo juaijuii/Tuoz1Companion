@@ -44,7 +44,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -442,17 +442,36 @@ def _team_damage(participants: list, team_id) -> int | None:
     return total or None
 
 
+# 连机器人时顺带报给它的开关（只报开 / 关，机器人主人用来看有多少人开着、多少人关了）：(配置里的名字, 没写过时算开还是关)
+FEATURE_FLAGS = (("aram_helper", True), ("aram_auto", True), ("aram_panel", True), ("aram_ai_guide", True),
+                 ("aram_borderless", True), ("player_stats", True))
+
+
+def feature_flags(config: dict, gui: bool) -> str:
+    """几个开关现在的状态，写成 "gui=1;aram_helper=1;aram_auto=0;…"。
+    没开窗口（--no-gui）时海克斯助手这些都用不了，只报 gui=0"""
+    if not gui:
+        return "gui=0"
+    return ";".join(["gui=1"] + [f"{key}={int(config.get(key, default) is not False and bool(config.get(key, default)))}"
+                                 for key, default in FEATURE_FLAGS])
+
+
 class BotAPI:
     def __init__(self, server: str, token: str):
         self.server = server.rstrip("/")
         self.headers = {"Authorization": f"Bearer {token}"}
+        self.config: dict | None = None    # main() 填上以后，ping 时顺带报开关状态；没填就不报
+        self.gui = False
 
     def ping(self, game_name: str = "", tag_line: str = "") -> dict:
         # 机器人第一次响应时要去数据库拉每个服务器的绑定，可能要几十秒
         url = self.server + "/api/companion/ping"
         if game_name and tag_line:
             url += "?" + urllib.parse.urlencode({"game_name": game_name, "tag_line": tag_line})
-        return _http_json("GET", url, self.headers, timeout=90) or {}
+        headers = dict(self.headers)
+        if self.config is not None:
+            headers["X-Companion-Features"] = feature_flags(self.config, self.gui)
+        return _http_json("GET", url, headers, timeout=90) or {}
 
     def post_match(self, payload: dict) -> dict:
         return _http_json("POST", self.server + "/api/companion/match", self.headers, body=payload, timeout=60) or {}
@@ -2084,6 +2103,8 @@ class AramAssistant:
         self._icons_busy: set = set()      # 正在读的
         self._icons_retry: dict = {}       # 没读到的：英雄编号 -> 什么时候可以再试
         self._icons_lock = threading.Lock()
+        self._report_timer = None          # 开关变了以后，过几秒向机器人补报一次的定时器
+        self._report_lock = threading.Lock()
         self.guide_off_until = 0.0
         self.started_game = None           # 哪一局已经确认开打了
         self.next_clock = 0.0
@@ -2100,6 +2121,22 @@ class AramAssistant:
         self.config["aram_helper"] = bool(on)
         save_config(self.config)
         logger.info("海克斯助手：已开启（海克斯大乱斗里三选一时自动标出推荐）" if on else "海克斯助手：已关闭")
+        self._report_soon()
+
+    def _report_soon(self) -> None:
+        """开关变了：5 秒后告诉机器人一声（连着点几下只报最后一次）。报不上也没关系，下次连机器人时还会报"""
+        with self._report_lock:
+            if self._report_timer is not None:
+                self._report_timer.cancel()
+
+            def work():
+                try:
+                    self.bot.ping()
+                except Exception as e:
+                    logger.debug(f"开关状态没报上: {e}")
+            self._report_timer = threading.Timer(5.0, work)
+            self._report_timer.daemon = True
+            self._report_timer.start()
 
     def option(self, key: str) -> bool:
         """细项开关：没写过就是开"""
@@ -2110,6 +2147,7 @@ class AramAssistant:
         save_config(self.config)
         label = dict(ARAM_OPTIONS).get(key, key)
         logger.info(f"海克斯助手：「{label}」已{'开启' if on else '关闭'}")
+        self._report_soon()
 
     @property
     def hotkey_name(self) -> str:
@@ -4056,6 +4094,8 @@ def main() -> int:
         server = args.server if args.server.startswith(("http://", "https://")) else "http://" + args.server
         logger.warning(f"[调试] 本次临时连接 {server}（不会保存）")
     bot = BotAPI(server, config["token"])
+    bot.config = config                 # 连机器人时顺带报开关状态（见 feature_flags）
+    bot.gui = bool(IS_WINDOWS and not args.no_gui and not (args.import_blacklist or args.file))
     companion = Companion(config, bot, args)
     while True:
         status = companion.check_bot()
