@@ -48,7 +48,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.9.4"
+VERSION = "1.9.5"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -375,6 +375,15 @@ def _http_json(method: str, url: str, headers: dict, body: dict | None = None,
 _HISTORY_GUARD = threading.Lock()
 _HISTORY_LOCKS: dict = {}                       # puuid -> 锁：同一个人的战绩同时只查一次
 _HISTORY_SLOTS = threading.Semaphore(4)         # 查别人战绩的请求同时最多 4 个
+# 实测（2026-11）：客户端查别人的战绩是一个一个来的，每人 20 局约 5.6 秒，同时发过去的在客户端里排队——
+# 十个人排到最后一个要将近一分钟。以前等 15 秒就放弃，结果十个人里只有头两个查得到。所以要等得够久；
+# 查过的存 10 分钟（选人时提前查好的队友，要撑到读条时用）
+HISTORY_TIMEOUT = 75
+HISTORY_KEEP_SECONDS = 600
+# 每人查最近多少局。耗时和局数成正比（实测 20 局约 5.6 秒、10 局约 3.3 秒、5 局约 2.1 秒），对面五个人要到读条才知道是谁，
+# 20 局的话五个人要将近半分钟、读条常常不够，所以用 10 局。十人战绩和开局情报必须用同一个数：
+# 客户端对同一个人只认第一次查的局数，之后再要更多局，给回来的还是第一次那些
+HISTORY_GAMES = 10
 
 
 class LCU:
@@ -430,26 +439,27 @@ class LCU:
         platform = hist.get("platformId") or ""
         return (games[0] if games else None), platform
 
-    def match_history(self, puuid: str, count: int = 20) -> list[dict]:
+    def match_history(self, puuid: str, count: int = HISTORY_GAMES) -> list[dict]:
         """任意玩家（puuid）最近 count 局。客户端里点开别人的战绩用的就是这个接口"""
-        # 开局情报和十人战绩都要查对面的人：两分钟内查过的直接用，不让客户端重复去问
+        # 开局情报和十人战绩都要查对面的人：刚查过的直接用，不让客户端重复去问
         # 而且同一个人同时只问一次（后到的等先到的结果），全插件同时最多 4 个请求：
         # 读条时客户端本来就忙，一口气问十几个人的战绩会把它卡到连「现在什么阶段」都答不上来
         cache = self.__dict__.setdefault("_history_cache", {})
         hit = cache.get((puuid, count))
-        if hit and time.time() - hit[0] < 120:
+        if hit and time.time() - hit[0] < HISTORY_KEEP_SECONDS:
             return hit[1]
         with _HISTORY_GUARD:
             lock = _HISTORY_LOCKS.setdefault(puuid, threading.Lock())
         with lock:
             hit = cache.get((puuid, count))
-            if hit and time.time() - hit[0] < 120:
+            if hit and time.time() - hit[0] < HISTORY_KEEP_SECONDS:
                 return hit[1]
             with _HISTORY_SLOTS:
-                data = self.get(f"/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex={count - 1}", timeout=15) or {}
+                data = self.get(f"/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex={count - 1}",
+                                timeout=HISTORY_TIMEOUT) or {}
             games = ((data.get("games") or {}).get("games")) or []
             cache[(puuid, count)] = (time.time(), games)
-        for key in [k for k, v in list(cache.items()) if time.time() - v[0] > 300]:
+        for key in [k for k, v in list(cache.items()) if time.time() - v[0] > HISTORY_KEEP_SECONDS + 300]:
             cache.pop(key, None)
         if len(_HISTORY_LOCKS) > 200:
             with _HISTORY_GUARD:
@@ -1062,7 +1072,7 @@ class Companion:
             logger.warning(f"通知机器人开局失败: {e}")
 
     def scout_enemies(self, game_id: int, start_payload: dict, players: list[dict]) -> None:
-        """开局情报：对面每个人最近 20 局的原始数据交给机器人，谁是大哥、谁开黑由机器人算（改算法不用发新版插件）。
+        """开局情报：对面每个人最近 10 局（HISTORY_GAMES）的原始数据交给机器人，谁是大哥、谁开黑由机器人算（改算法不用发新版插件）。
         只读客户端接口，不碰 Riot API；任何失败只记日志"""
         try:
             my_team = next((p["team"] for p in players if p.get("is_me")), None)
@@ -2530,9 +2540,9 @@ ARAM_OPTIONS = (("aram_auto", "海克斯选择推荐"),
                 ("aram_panel", "选人和读条时的攻略侧栏"),
                 ("aram_ai_guide", "AI 开局攻略"))
 # 全屏时自动改成无边框不放进细项：默认就开着，只能在配置文件里用 "aram_borderless": false 关
-ARAM_PLAYER_GAMES = 20          # 十人战绩：每人看最近这么多局
+ARAM_PLAYER_GAMES = HISTORY_GAMES   # 十人战绩：每人看最近这么多局（见 HISTORY_GAMES 的说明）
 ARAM_PREMADE_SHARED = 3         # 两个人最近的对局里有这么多局是同一局，就算一起开黑的
-ARAM_BOSS_MIN_GAMES, ARAM_BOSS_MIN_WIN = 8, 0.55
+ARAM_BOSS_MIN_GAMES, ARAM_BOSS_MIN_WIN = 5, 0.55
 
 
 def live_clock(lcu) -> float | None:
@@ -2626,27 +2636,12 @@ def summarize_player(games: list, puuid: str, skip_game_id=None) -> dict:
             "dpm": round(damage / (seconds / 60)) if seconds > 0 else None, "game_ids": ids}
 
 
-def collect_player_stats(lcu, teams: list, game_id=None) -> list:
-    """双方十个人的近期战绩，顺序和客户端给的一样（读条界面的卡片也是这个顺序）。
-    每人一行：{"team", "slot", "is_me", "champion_id", "games", "win_rate", "kda", "premade", "boss"}。
-    premade = 和他一起开黑的一共几个人（0 = 单排）；boss = 这一队里近期打得最凶的那个（「大哥」）。
-    只读客户端的战绩接口，和点开别人的战绩页是同一个接口"""
-    from concurrent.futures import ThreadPoolExecutor
-
-    def fetch(p: dict) -> dict:
-        stats = {"games": 0, "wins": 0, "win_rate": None, "kda": None, "dpm": None, "game_ids": set()}
-        if p.get("puuid"):
-            try:
-                stats = summarize_player(lcu.match_history(p["puuid"], ARAM_PLAYER_GAMES), p["puuid"], game_id)
-            except Exception as e:
-                logger.debug(f"十人战绩：查 {p['puuid'][:8]} 失败: {e}")
-        return {"team": p["team"], "is_me": bool(p.get("is_me")), "champion_id": p.get("champion_id") or 0, **stats}
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        rows = list(pool.map(fetch, teams))
+def player_stat_rows(done: list) -> list:
+    """已经查到的那几个人 -> 可以显示的行（开黑、「大哥」在已经查到的人里算；后面的人查到了会再算一遍）。
+    done 里每一项带着 team、slot（在自己队里排第几，按读条界面的顺序）和 game_ids"""
+    rows = [dict(r) for r in done]
     for team in (1, 2):
         mates = [r for r in rows if r["team"] == team]
-        for slot, r in enumerate(mates):
-            r["slot"] = slot
         # 开黑：一起打过够多局的连成一组（甲和乙、乙和丙一起打过，三个人就是一组）
         group = list(range(len(mates)))
         for i in range(len(mates)):
@@ -2663,7 +2658,44 @@ def collect_player_stats(lcu, teams: list, game_id=None) -> list:
             r["boss"] = r is boss
     for r in rows:
         r.pop("game_ids", None)
-    return rows
+    return sorted(rows, key=lambda r: (r["team"], r["slot"]))
+
+
+def collect_player_stats(lcu, teams: list, game_id=None, on_update=None) -> list:
+    """双方十个人的近期战绩，顺序和客户端给的一样（读条界面的卡片也是这个顺序）。
+    每人一行：{"team", "slot", "is_me", "champion_id", "games", "win_rate", "kda", "premade", "boss"}。
+    premade = 和他一起开黑的一共几个人（0 = 单排）；boss = 这一队里近期打得最凶的那个（「大哥」）。
+    只读客户端的战绩接口，和点开别人的战绩页是同一个接口。
+
+    客户端查得慢（一个一个来，每人好几秒），十个人都等齐读条早结束了：给了 on_update 的话，
+    每查到一个人就把「到现在查到的这些人」交给它一次（读条界面上查到一个贴一个）"""
+    from concurrent.futures import ThreadPoolExecutor
+    counts = {1: 0, 2: 0}
+    jobs = []
+    for p in teams:                                   # 每个人在自己队里排第几：按名单的顺序定，和谁先查到无关
+        jobs.append((p, counts.get(p["team"], 0)))
+        counts[p["team"]] = counts.get(p["team"], 0) + 1
+    done, guard = [], threading.Lock()
+
+    def fetch(job) -> None:
+        p, slot = job
+        stats = {"games": 0, "wins": 0, "win_rate": None, "kda": None, "dpm": None, "game_ids": set()}
+        if p.get("puuid"):
+            try:
+                stats = summarize_player(lcu.match_history(p["puuid"], ARAM_PLAYER_GAMES), p["puuid"], game_id)
+            except Exception as e:
+                logger.debug(f"十人战绩：查 {p['puuid'][:8]} 失败: {e}")
+        row = {"team": p["team"], "slot": slot, "is_me": bool(p.get("is_me")), "champion_id": p.get("champion_id") or 0, **stats}
+        with guard:
+            done.append(row)
+            if on_update is not None and len(done) < len(jobs):
+                try:
+                    on_update(player_stat_rows(done))
+                except Exception as e:
+                    logger.debug(f"十人战绩：{e}")
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        list(pool.map(fetch, jobs))
+    return player_stat_rows(done)
 
 
 class AramAssistant:
@@ -2713,6 +2745,9 @@ class AramAssistant:
         self.select_state = None           # 选人界面：我的英雄 + 候选席（变了才通知窗口）
         self.select_mayhem = None          # 这次选人是不是海克斯大乱斗（None = 还没问）
         self.next_select = 0.0
+        self.next_prefetch = 0.0           # 选人时提前查队友战绩：下次什么时候再看一眼名单
+        self.prefetched: set = set()       # 已经提前查过（或者正在查）的人
+        self.prefetching = False
         self.prepared_game = None          # 已经为哪一局准备过读条数据（十人战绩、攻略）
         self._icons: dict = {}             # 英雄编号 -> 头像图的原始内容（从本机客户端读的，一次开机每个英雄只读一回）
         self._icons_busy: set = set()      # 正在读的
@@ -2884,6 +2919,11 @@ class AramAssistant:
         elif self.select_state is not None or self.select_mayhem is not None:
             self.select_state, self.select_mayhem = None, None
             self.events.put(("select", None))
+        if (phase == "ChampSelect" and not c.current_game_id and now >= self.next_prefetch and not self.prefetching
+                and self.config.get("player_stats", True) is not False):
+            self.next_prefetch = now + 5
+            self.prefetching = True
+            threading.Thread(target=self._prefetch_team, args=(lcu,), daemon=True, name="aram-prefetch").start()
         info = self.game_info()
         if info and info.get("teams") and info.get("game_id") != self.prepared_game:
             self.prepared_game = info["game_id"]
@@ -2891,6 +2931,37 @@ class AramAssistant:
         elif not info and self.prepared_game is not None:
             self.prepared_game = None
             self.events.put(("pregame", None))
+
+    # --- 选人时提前查队友的战绩 ---
+    def _prefetch_team(self, lcu) -> None:
+        """客户端查一个人的战绩要五六秒、还得一个一个来，十个人全留到读条再查根本来不及。
+        队友在选人时就知道是谁了：这时先查好存着，读条时只剩对面五个人要查。
+        只在五个人一队的模式里做（和十人战绩一样）；看不到队友是谁的模式（单双排）名单里没有 puuid，自然就跳过"""
+        try:
+            session = lcu.get("/lol-champ-select/v1/session", timeout=4) or {}
+            team = [m for m in session.get("myTeam") or [] if isinstance(m, dict)]
+            if len(team) != 5:
+                return
+            if len(self.prefetched) > 60:
+                self.prefetched.clear()
+            for m in team:
+                puuid = str(m.get("puuid") or "")
+                if len(puuid) < 30 or puuid.startswith("00000000") or puuid in self.prefetched:
+                    continue
+                self.prefetched.add(puuid)
+                try:
+                    started = time.time()
+                    lcu.match_history(puuid, ARAM_PLAYER_GAMES)
+                    logger.debug(f"十人战绩：选人时先查好了一个队友（{time.time() - started:.1f} 秒）")
+                except Exception as e:
+                    self.prefetched.discard(puuid)                # 没查成：下一轮再试
+                    logger.debug(f"十人战绩：选人时查队友失败: {e}")
+                if self.companion.last_phase != "ChampSelect":
+                    return                                        # 已经进游戏了：剩下的交给读条时那一轮
+        except Exception as e:
+            logger.debug(f"十人战绩：选人时读名单失败: {e}")
+        finally:
+            self.prefetching = False
 
     # --- 无边框 ---
     def ensure_borderless(self, lcu) -> str:
@@ -3089,9 +3160,15 @@ class AramAssistant:
                 sizes = [sum(1 for p in teams if p["team"] == n) for n in (1, 2)]
                 if sizes == [5, 5] and self.config.get("player_stats", True) is not False:
                     started = time.time()
-                    data["players"] = collect_player_stats(lcu, teams, game_id)
+
+                    def partly(rows):                 # 查到一个贴一个
+                        data["players"] = rows
+                        publish()
+                    data["players"] = collect_player_stats(lcu, teams, game_id, partly)
                     publish()
-                    logger.debug(f"十人战绩：{time.time() - started:.1f} 秒")
+                    got = sum(1 for r in data["players"] if r.get("games"))
+                    logger.info(f"十人战绩：{got} / {len(teams)} 个人查到了，用了 {time.time() - started:.0f} 秒"
+                                + ("（客户端查别人的战绩是一个一个来的，没查过的每人要五六秒）" if time.time() - started > 20 else ""))
             except Exception as e:
                 logger.debug(f"十人战绩：{e}")
 
@@ -3965,9 +4042,9 @@ def player_badge(row: dict, game_mode: str = "") -> tuple[str, str, str, str, st
 
 
 class LoadingBadges:
-    """读条界面上的十人战绩：每张英雄卡片的底边贴一条小标签（近 20 局胜率 · KDA，开黑的标「双排 / 三排」，
+    """读条界面上的十人战绩：每张英雄卡片的底边贴一条小标签（近 10 局胜率 · KDA，开黑的标「双排 / 三排」，
     再按 KDA 评个「上等马 / 中等马 / 下等马 / 牛马」，一队里近期打得最凶的那个是「精品上等马」）。透明、鼠标点得穿、不抢焦点，和 AramOverlay 是同一种窗口。
-    过程：战绩查到了、游戏窗口也出来了 → 十条标签一起 150 毫秒淡入 → 读条结束（游戏里开始走时间）→ 淡出。
+    过程：有人的战绩查到了、游戏窗口也出来了 → 已经查到的那几条 150 毫秒淡入，之后查到一个贴一个 → 读条结束（游戏里开始走时间）→ 淡出。
     卡片从左到右的顺序用的是客户端的选英雄记录，上排是蓝色方、下排是红色方"""
 
     def __init__(self, root, assistant: AramAssistant):
