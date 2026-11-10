@@ -46,6 +46,11 @@ jobs:
           fi
           echo "TAG=$TAG" >> "$GITHUB_ENV"
 
+      # 插件靠 http.client 里的这个内部钩子换掉连接方式（先连 IPv4、不在连不通的地址上干等）。
+      # 哪天 Python 把它改没了，这一步会失败，而不是悄悄退回老的连法
+      - name: 检查连接方式的钩子还在
+        run: python -c "import http.client, inspect; assert '_create_connection' in inspect.getsource(http.client.HTTPConnection.connect)"
+
       - name: 打包 exe
         run: python -m PyInstaller --onefile --console --clean --name Tuoz1Companion --icon tuoz1.ico --add-data "tuoz1.ico;." --add-data "assets/ocr/ch_PP-OCRv4_rec_infer.onnx;assets/ocr" --collect-binaries onnxruntime tuoz1_companion.py
 

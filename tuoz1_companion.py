@@ -30,11 +30,13 @@ from __future__ import annotations
 import argparse
 import base64
 import difflib
+import http.client
 import json
 import logging
 import math
 import os
 import re
+import socket
 import ssl
 import subprocess
 import sys
@@ -46,7 +48,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.9.2"
+VERSION = "1.9.3"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -281,6 +283,73 @@ class HttpError(Exception):
         self.body = body
 
 
+CONNECT_SECONDS = 4             # 连一个地址最多等这么久，连不上就换下一个（正常连上用不了 1 秒）
+_GOOD_ADDR: dict = {}           # (域名, 端口) -> 上次连通的那个地址：下次先连它
+_OPENER = None
+
+
+def _quick_connect(address, timeout=None, source_address=None, **_ignored):
+    """代替 socket.create_connection。一个域名常常同时有 IPv4 和 IPv6 两个地址，系统把 IPv6 排在前面；
+    玩家家里的宽带有 IPv6、而那个 IPv6 地址其实连不通时，自带的连法会在它上面等满整个超时（8 秒、15 秒、
+    最长约 21 秒）才换 IPv4 —— 每一次请求都要白等这么久（实测：三选一 8 秒才出、选人侧栏晚十几秒、
+    AI 建议晚二十多秒）。这里改成：上次连通的地址最先试，其次 IPv4，每个地址最多等 CONNECT_SECONDS 秒"""
+    host, port = address
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    good = _GOOD_ADDR.get((host, port))
+    infos.sort(key=lambda i: (i[4] != good, i[0] != socket.AF_INET))       # 排序是稳定的：其余的保持系统给的先后
+    total = timeout if isinstance(timeout, (int, float)) else socket.getdefaulttimeout()
+    last = None
+    for family, kind, proto, _, addr in infos:
+        sock = None
+        try:
+            sock = socket.socket(family, kind, proto)
+            sock.settimeout(min(total, CONNECT_SECONDS) if total else CONNECT_SECONDS)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(addr)
+            sock.settimeout(total)                    # 连上以后，等回应的时间还是调用的人说了算
+            _GOOD_ADDR[(host, port)] = addr
+            return sock
+        except OSError as e:
+            last = e
+            if sock is not None:
+                sock.close()
+    _GOOD_ADDR.pop((host, port), None)
+    raise last if last is not None else OSError(f"{host} 没有解析出地址")
+
+
+class _QuickHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _quick_connect
+
+
+class _QuickHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _quick_connect
+
+
+class _QuickHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_QuickHTTPConnection, req)
+
+
+class _QuickHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_QuickHTTPSConnection, req, context=self._quick_context)
+
+
+def _open(req, timeout: float):
+    """连外面的服务器（机器人、GitHub）都走这里；连本机的客户端 / 游戏用不着（只有一个地址）"""
+    global _OPENER
+    if _OPENER is None:
+        https = _QuickHTTPSHandler()
+        https._quick_context = ssl.create_default_context()
+        _OPENER = urllib.request.build_opener(_QuickHTTPHandler(), https)
+    return _OPENER.open(req, timeout=timeout)
+
+
 def _http_json(method: str, url: str, headers: dict, body: dict | None = None,
                timeout: float = 15, ssl_context: ssl.SSLContext | None = None):
     data = None
@@ -292,7 +361,8 @@ def _http_json(method: str, url: str, headers: dict, body: dict | None = None,
         hdrs["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context) as resp:
+        with (_open(req, timeout) if ssl_context is None
+              else urllib.request.urlopen(req, timeout=timeout, context=ssl_context)) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as e:
         raw = e.read() or b""
@@ -548,7 +618,7 @@ def fetch_latest_release() -> tuple[str, str, int] | None:
 
 def download_file(url: str, dest: Path, expected_size: int = 0) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": f"tuoz1-companion/{VERSION}"})
-    with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as f:
+    with _open(req, 120) as resp, open(dest, "wb") as f:
         while True:
             chunk = resp.read(1024 * 256)
             if not chunk:
@@ -1853,7 +1923,9 @@ def game_blocks_keys() -> bool:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        return bool(pid.value) and process_elevated(pid.value) is not False
+        # 只在确定是管理员身份时才算：反作弊护着游戏进程，常常查不了（None），查不了不等于它权限比我们高。
+        # 查不了的情况由侧栏看实际情况来判断（AramPanel._watch_input）
+        return bool(pid.value) and process_elevated(pid.value) is True
     except Exception:
         return False
 
@@ -2322,6 +2394,9 @@ ARAM_PEEK_VK = 0x09             # 收起以后按住这个键（Tab，也就是�
 ARAM_PICK_LEVELS = (1, 7, 11, 15, 21)
 ARAM_PICK_MAX = 5               # 一局最多能选几次：普通的四次 + 嘉宾带来的一次（21 级那次，或者 KDA 额外的那次）
 ARAM_FOUNTAIN_GRACE = 30        # 复活以后这么多秒内当作人还在泉水（这时升到对应等级，卡片也会出来）
+ARAM_GUIDE_MIN_ENEMIES = 3      # 对面至少这么多人才写 AI 建议（和机器人那边的规矩一样）：一个人的自定义对局没有阵容可分析
+ARAM_INPUT_KEYS = (0x01, 0x02, 0x09, 0x20, 0x51, 0x57, 0x45, 0x52, 0x44, 0x46)   # 鼠标左右键、Tab、空格、Q W E R D F
+ARAM_INPUT_QUIET_SECONDS = 120  # 对局里游戏在最前面累计这么久、上面这些键一次都没看到：多半是系统不让插件看按键
 ARAM_CARD_RETRY_WAITS = (4, 10, 20, 40)    # 英雄攻略卡没取到（机器人刚重启时很慢、会超时）：隔这么多秒再试，一共试 5 次
 ARAM_PICK_CONFIRM_SECONDS = 60  # 标注过的卡片消失了这么久才算「这一次选完了」（玩家可以把卡片收起来再打开，消失不等于选完）
 ARAM_FIRST_PICK_SECONDS = 180   # 开局第一次：从这局第一次问到等级算起，这么久内只要还没选就一直找（之后还没认到过，就不再为它一直截了）
@@ -2868,8 +2943,17 @@ class AramAssistant:
         这条线自己留下来盯游戏里的时钟：一有时间了 = 读条结束（收掉读条界面上的战绩标签），
         到 ARAM_PANEL_HIDE_AT 秒再收攻略侧栏"""
         game_id, teams = info["game_id"], info.get("teams") or []
+        mine = next((p["team"] for p in teams if p.get("is_me")), None)
+        allies = [p["champion_id"] for p in teams if p["team"] == mine and p["champion_id"]]
+        enemies = [p["champion_id"] for p in teams if p["team"] != mine and p["champion_id"]]
+        want_panel = bool(self.is_mayhem(info) and info.get("champion_id") and self.enabled and self.option("aram_panel"))
+        want_guide = want_panel and self.option("aram_ai_guide") and time.time() >= self.guide_off_until
+        if want_guide and len(enemies) < ARAM_GUIDE_MIN_ENEMIES:
+            want_guide = False
+            logger.info(f"海克斯助手：对面不到 {ARAM_GUIDE_MIN_ENEMIES} 个人（自定义 / 练习），这局不写 AI 建议；出装、加点和三选一的标注照常")
+        # guide_failed：这局不会有 AI 建议（不写，或者没写成）——侧栏就不显示「AI 分析中」的占位条
         data = {"game_id": game_id, "mayhem": self.is_mayhem(info), "champion_id": info.get("champion_id"), "game_mode": info.get("game_mode") or ("KIWI" if self.is_mayhem(info) else ""),
-                "players": None, "card": None, "guide": None}
+                "players": None, "card": None, "guide": None, "guide_failed": not want_guide}
 
         def publish():
             if self.prepared_game == game_id:         # 这会儿还是这一局
@@ -2888,17 +2972,16 @@ class AramAssistant:
 
         def guide():
             try:
-                if self.option("aram_ai_guide") and time.time() >= self.guide_off_until:
-                    started = time.time()
-                    mine = next((p["team"] for p in teams if p.get("is_me")), None)
-                    resp = self.bot.post_aram_guide({
-                        "companion_version": VERSION, "game_id": game_id, "champion_id": info["champion_id"],
-                        "allies": [p["champion_id"] for p in teams if p["team"] == mine and p["champion_id"]],
-                        "enemies": [p["champion_id"] for p in teams if p["team"] != mine and p["champion_id"]]})
-                    if resp.get("ok") and resp.get("lines"):
-                        data["guide"] = resp["lines"]
-                        publish()
-                        logger.info(f"海克斯攻略（{time.time() - started:.1f} 秒）：" + "；".join(f"{ln.get('label')}：{ln.get('text')}" for ln in resp["lines"]))
+                # 一局只问这一次（prepared_game 记着这局问过了，切出去再切回来不会重问）；
+                # 机器人那边同一局同一个英雄也只让 AI 写一次，再问给的是存着的那份，不再花钱
+                started = time.time()
+                resp = self.bot.post_aram_guide({
+                    "companion_version": VERSION, "game_id": game_id, "champion_id": info["champion_id"],
+                    "allies": allies, "enemies": enemies})
+                if resp.get("ok") and resp.get("lines"):
+                    data["guide"] = resp["lines"]
+                    publish()
+                    logger.info(f"海克斯攻略（{time.time() - started:.1f} 秒）：" + "；".join(f"{ln.get('label')}：{ln.get('text')}" for ln in resp["lines"]))
             except HttpError as e:
                 if e.status in (404, 503):            # 机器人不支持 / AI 没开 / 超了上限：这次开机别每局都问了
                     self.guide_off_until = time.time() + (3600 if e.status == 404 else 600)
@@ -2937,8 +3020,9 @@ class AramAssistant:
         if data["mayhem"] and info.get("champion_id") and self.enabled and self.option("aram_local_ocr"):
             threading.Thread(target=self._prepare_local, args=(info["champion_id"], game_id), daemon=True,
                              name="aram-table").start()
-        if data["mayhem"] and info.get("champion_id") and self.enabled and self.option("aram_panel"):
+        if want_guide:
             threading.Thread(target=guide, daemon=True, name="aram-guide").start()     # AI 最慢，最先出发
+        if want_panel:
             threading.Thread(target=card, daemon=True, name="aram-card").start()
         loaded, deadline = False, time.time() + 900
         while self.prepared_game == game_id and time.time() < deadline:
@@ -3976,6 +4060,11 @@ class AramPanel:
         self.picking = False          # 三选一的标注现在是不是显示着（是的话侧栏显示海克斯那一页）
         self.tab_noted = None         # 哪一局已经在日志里说过「按了 Tab」了（一局只说一次）
         self.keys_checked = None      # 哪一局已经查过「游戏的权限是不是比插件高」了
+        self.keys_warned = None       # 哪一局已经提示过「系统不让插件看到按键」了
+        self.input_game = None        # 下面三样是哪一局的
+        self.input_seen = False       # 这一局看到过按键 / 鼠标点击没有（看到过 = 没被挡）
+        self.input_quiet = 0.0        # 这一局游戏在最前面、却什么按键都没看到，累计多少秒了
+        self.input_at = 0.0
         self.icons: dict = {}         # (英雄编号, 边长) -> 缩好的头像图；None = 这张图解不开，不再试
         self.icon_slots: list = []    # 现在画面上还在等头像的位置：(英雄编号, 边长, 那个 Label)
         self.show_gen = 0             # 第几次「滑进来」：收起 / 淡出以后，上一次滑进来剩下的几步就不走了
@@ -4516,6 +4605,29 @@ class AramPanel:
             logger.debug(f"攻略侧栏出错: {e}")
         self.root.after(200, self._watch)
 
+    def _watch_input(self, w, game) -> None:
+        """系统让不让插件看到按键，看实际情况最准：进了游戏、游戏窗口在最前面，累计 ARAM_INPUT_QUIET_SECONDS 秒
+        一次按键、一次鼠标点击都没看到 → 多半是被挡了（游戏的权限比插件高），在日志里说一次；
+        只要看到过一次，这一局就不用再查。读条时不算（那时本来就没人按）"""
+        now = time.time()
+        if game != self.input_game:
+            self.input_game, self.input_seen, self.input_quiet, self.input_at = game, False, 0.0, now
+        step, self.input_at = min(max(now - self.input_at, 0.0), 0.2), now
+        if self.input_seen or self.keys_warned == game or game != self.loaded_game:
+            return
+        hwnd = find_game_window()
+        if not hwnd or hwnd != int(w.GetForegroundWindow() or 0):
+            return
+        if any(w.GetAsyncKeyState(vk) for vk in ARAM_INPUT_KEYS):
+            self.input_seen = True
+            return
+        self.input_quiet += step
+        if self.input_quiet >= ARAM_INPUT_QUIET_SECONDS:
+            self.keys_warned = game
+            logger.warning(f"海克斯助手：进游戏后游戏窗口在最前面已经 {ARAM_INPUT_QUIET_SECONDS // 60} 分钟，插件一次按键和鼠标点击都没看到。"
+                           "多半是游戏以管理员身份运行、插件是普通权限，系统不让插件看按键：按住 Tab 看出装会没有反应，"
+                           "右键插件选「以管理员身份运行」就可以了。如果这段时间你确实没碰键盘鼠标，不用管这条")
+
     def _watch_key(self) -> None:
         """海克斯大乱斗对局里，每 40 毫秒看一眼 Tab 是不是按着：按下去侧栏出来，松开收起。
         同时按着 Alt 的不算（那是在切窗口）；游戏不在最前面时 _target 本来就不让显示"""
@@ -4530,8 +4642,10 @@ class AramPanel:
                 if game != self.keys_checked and find_game_window():
                     self.keys_checked = game
                     if game_blocks_keys():
+                        self.keys_warned = game
                         logger.warning("海克斯助手：游戏是用管理员身份运行的，插件是普通权限，系统不让插件看到按键："
                                        "按住 Tab 看出装会没有反应。右键插件选「以管理员身份运行」就可以了（三选一的标注和侧栏不受影响）")
+                self._watch_input(w, game)
                 if down and game != self.tab_noted and game_layout():
                     self.tab_noted = game             # 这一局第一次在游戏里按 Tab：记一行，出了问题好查
                     if self._has_guide():
