@@ -12,7 +12,7 @@
 ## 使用方法
 
 1. 在 Discord 里先 `/bind` 绑定账号，再输入 `/companion_token`，机器人会私下回复 **令牌**。
-2. 双击运行 `Tuoz1Companion.exe`，按提示粘贴令牌，只需输入一次（保存在同目录的 `companion_config.json`）。
+2. 双击运行 `Tuoz1Companion.exe`，按提示粘贴令牌，只需输入一次（保存在配置文件里，位置见下面的「配置文件在哪」）。
    机器人地址已经内置在插件里，不需要也不能自己填。
 3. 打游戏时保持插件窗口开着。打完一局后，插件会等客户端生成战绩（通常几十秒），然后自动上报。
 4. 和平时一样，待在语音频道里机器人才会播报。打完时不在语音也没关系，30 分钟内进语音会自动补播。
@@ -62,6 +62,14 @@ pip install numpy onnxruntime
 
 不想要窗口，加 `--no-gui` 只用命令行。
 
+## 配置文件在哪
+
+令牌和各种开关都存在 `companion_config.json` 里。从 v1.9.8 起它固定放在 `%APPDATA%\Tuoz1Companion\`（按 Win+R，输入 `%APPDATA%\Tuoz1Companion` 回车就能打开），不再和 exe 放在一起——所以把插件挪到别的文件夹不用重新输入令牌。从老版本更新上来的，第一次打开时会自动把 exe 旁边那份搬过去。
+
+下文说「在 `companion_config.json` 里加一行」的，改的都是这个位置的文件；改完重开插件生效。日志 `companion.log` 还是在 exe 旁边。
+
+（直接用 Python 运行源码时，配置文件还是和 `tuoz1_companion.py` 放在一起。）
+
 ## 桌面快捷方式
 
 从 v1.9.6 起，第一次打开插件时会在桌面放一个快捷方式「托子的小警察」，以后从桌面打开就行。插件本体还在你下载到的那个文件夹里，别删它。
@@ -84,7 +92,7 @@ python tuoz1_companion.py --no-gui         # 不开窗口，只用命令行
 python tuoz1_companion.py -v               # 详细日志
 ```
 
-日志写在同目录的 `companion.log`。
+日志写在 exe（或源码）同目录的 `companion.log`。
 
 ## 批量导入黑名单
 
