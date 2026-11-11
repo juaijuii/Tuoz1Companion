@@ -48,7 +48,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.9.6"
+VERSION = "1.9.7"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -850,6 +850,7 @@ def ensure_desktop_shortcut(config: dict, exe: Path | None = None, desktop: Path
 # 管理员权限：游戏通常是以管理员身份在跑，插件权限比它低的话系统不让插件看到按键（按住 Tab 看出装就没反应）
 # ----------------------------------------------------------------------------
 ELEVATE_LINGER_SECONDS = 6      # 申请到权限、开出管理员身份的自己以后，原来这个进程再留这么久才退出（比自动更新盯的 3 秒长）
+ELEVATE_WAIT_SECONDS = 20       # 确认框最多等这么久；还没人点（自动更新后弹的框常常只在任务栏里闪，人在打游戏根本没看见）就先照常运行
 
 
 def relaunch_elevated(argv: list) -> str:
@@ -886,18 +887,49 @@ def ensure_elevated(args) -> bool:
             return False
         logger.info("正在申请管理员权限，Windows 会弹一次确认框，点「是」就行。原因：游戏通常以管理员身份运行，"
                     "插件权限比它低的话系统不让插件看到按键，对局里按住 Tab 看出装会没有反应")
-        result = relaunch_elevated(sys.argv[1:] + ["--elevated"])
     except Exception as e:
         logger.debug(f"申请管理员权限出错: {e}")
-        result = "failed"
+        return False
+    denied = ("没有拿到管理员权限（确认框点了「否」，或者这个账号不是管理员）。插件照常运行，只是对局里按住 Tab 看出装可能没有反应。"
+              "不想每次被问：在 companion_config.json 里加一行 \"run_as_admin\": false")
+    born, state, guard = time.time(), {"result": None, "late": False}, threading.Lock()
+
+    def ask():
+        # 弹确认框这一步会一直卡到有人点为止，所以放在另一条线上：以前在主线上等，
+        # 确认框没人点（自动更新完弹的框只在任务栏里闪）的话插件就一直停在这儿，什么都不干
+        try:
+            result = relaunch_elevated(sys.argv[1:] + ["--elevated"])
+        except Exception as e:
+            logger.debug(f"申请管理员权限出错: {e}")
+            result = "failed"
+        with guard:
+            state["result"] = result
+            late = state["late"]
+        if not late:
+            return                                    # 主线还在等：结果交给它处理
+        if result == "started":
+            logger.info("拿到管理员权限了，换成管理员身份的那个接着运行")
+            os._exit(0)                               # 这个进程已经在照常干活了：直接让位，免得两个插件一起报战绩
+        logger.warning(denied)
+
+    worker = threading.Thread(target=ask, daemon=True, name="elevate")
+    worker.start()
+    worker.join(ELEVATE_WAIT_SECONDS)
+    with guard:
+        result = state["result"]
+        if result is None:
+            state["late"] = True
+    if result is None:
+        logger.info("确认框还没有人点（可能在任务栏里闪，点一下那个盾牌图标再点「是」）。插件先照常运行，"
+                    "点了「是」以后会自动换成管理员身份")
+        return False
     if result == "started":
         # 别马上退出：旧版本自动更新完会盯新版本 3 秒，看到它退出了就以为没启动成功、会再开一个出来。
         # 这几秒把自己的黑窗口藏起来（管理员身份的那个有它自己的窗口）
         show_console(False)
-        time.sleep(ELEVATE_LINGER_SECONDS)
+        time.sleep(max(0.0, ELEVATE_LINGER_SECONDS - (time.time() - born)))
         return True
-    logger.warning("没有拿到管理员权限（确认框点了「否」，或者这个账号不是管理员）。插件照常运行，只是对局里按住 Tab 看出装可能没有反应。"
-                   "不想每次被问：在 companion_config.json 里加一行 \"run_as_admin\": false")
+    logger.warning(denied)
     return False
 
 
@@ -1561,6 +1593,12 @@ class Companion:
             self.process_retries()          # 补报不依赖客户端：打完就关客户端的人，进语音后照样能补播
             if self.lcu is None:
                 if not self.connect_lcu():
+                    # 客户端没开的时候也照样看有没有新版本：以前这时候检查被整个跳过了，插件一直开着、游戏关着的人
+                    # 要等到下次开游戏才更新——而那时候往往马上就排队、选人，又没空更新了
+                    if self.update_due(now, ""):
+                        self.next_update_check, self.update_after_game = now + UPDATE_CHECK_SECONDS, False
+                        if check_for_update(not self.args.no_update):
+                            return
                     time.sleep(10)
                     continue
             try:
@@ -1847,6 +1885,9 @@ ZH_LOCALE = "zh_CN"
 LOCALE_CHECK_SECONDS = 3
 _LOCALE_RE = re.compile(r'^(settings:[ \t]*\r?\n(?:[ \t]+.*\r?\n)*?[ \t]+locale:[ \t]*)"?([A-Za-z_]*)"?', re.M)
 _DEFAULT_LOCALE_RE = re.compile(r'^[ \t]+default_locale:[ \t]*"?([A-Za-z_]+)"?', re.M)
+# locale_data 下面那份「这个区服认可的语言」名单：一行一个  - "en_AU"
+_AVAILABLE_RE = re.compile(r'^[ \t]+available_locales:[ \t]*\r?\n((?:[ \t]*-[ \t]*"?[A-Za-z_]+"?[ \t]*\r?\n)+)', re.M)
+_AVAILABLE_ITEM_RE = re.compile(r'^([ \t]*-[ \t]*)"?([A-Za-z_]+)"?[ \t]*(\r?\n)$')
 
 
 def lol_settings_path() -> Path:
@@ -1873,26 +1914,65 @@ def default_game_locale(path: Path | None = None) -> str:
         return "en_US"
 
 
-def write_game_locale(locale: str, path: Path | None = None) -> bool:
-    """把 settings 下面的 locale 改成 locale。只改这一行，其余原样保留；第一次改之前备份一份"""
+def listed_game_locales(raw: str) -> list | None:
+    """语言设置文件里「这个区服认可的语言」名单；文件里没有这份名单返回 None"""
+    m = _AVAILABLE_RE.search(raw)
+    if not m:
+        return None
+    return [i.group(2) for i in map(_AVAILABLE_ITEM_RE.match, m.group(1).splitlines(keepends=True)) if i]
+
+
+def _list_game_locale(raw: str, locale: str, present: bool) -> str:
+    """把 locale 加进（present=True）或者拿出（False）那份认可的语言名单，其余原样保留。没有名单就不动"""
+    m = _AVAILABLE_RE.search(raw)
+    if not m:
+        return raw
+    lines = m.group(1).splitlines(keepends=True)
+    items = [_AVAILABLE_ITEM_RE.match(ln) for ln in lines]
+    has = any(i and i.group(2) == locale for i in items)
+    if present and not has and items[-1]:
+        lines.append(f'{items[-1].group(1)}"{locale}"{items[-1].group(3)}')          # 照最后一行的缩进和换行来写
+    elif not present and has:
+        lines = [ln for ln, i in zip(lines, items) if not (i and i.group(2) == locale)]
+    return raw[:m.start(1)] + "".join(lines) + raw[m.end(1):]
+
+
+def write_game_locale(locale: str, path: Path | None = None, pin: bool = False, unlist: str = "") -> set:
+    """把 settings 下面的 locale 改成 locale。只改要改的那几行，其余原样保留；第一次改之前备份一份。
+    pin=True（开着汉化时）：再把 locale 加进认可的语言名单，并把文件设成只读——
+    这个区服的名单里没有 zh_CN，不这样的话 Riot 客户端每次启动都把语言改回去、把语言包换回去，
+    我们再改回来，下次启动它又得把简体中文的语言包重新下一遍（玩家手动汉化的老办法也是这两步）。
+    pin=False：文件恢复成可写。unlist：顺便把这个语言从名单里拿掉（只拿我们自己加进去的）。
+    返回做了哪几样：{"locale", "listed", "readonly"}，什么都没动是空的"""
     path = path or lol_settings_path()
     raw = path.read_bytes().decode("utf-8")
     new, n = _LOCALE_RE.subn(lambda m: f'{m.group(1)}"{locale}"', raw, count=1)
     if not n:
         raise RuntimeError("语言设置文件里没找到 settings.locale")
-    if new == raw:
-        return False
-    backup = path.with_name(path.name + ".tuoz1.bak")
-    if not backup.exists():
-        backup.write_bytes(raw.encode("utf-8"))
-    try:
-        os.chmod(path, 0o666)        # 有的工具会把它设成只读
-    except Exception:
-        pass
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(new.encode("utf-8"))
-    os.replace(tmp, path)
-    return True
+    did = {"locale"} if new != raw else set()
+    listed = _list_game_locale(new, locale, True) if pin else new
+    if unlist and unlist != locale:
+        listed = _list_game_locale(listed, unlist, False)
+    if listed != new:
+        did.add("listed")
+        new = listed
+    if new != raw:
+        backup = path.with_name(path.name + ".tuoz1.bak")
+        if not backup.exists():
+            backup.write_bytes(raw.encode("utf-8"))
+        try:
+            os.chmod(path, 0o666)    # 只读的文件换不掉，先改成可写
+        except Exception:
+            pass
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(new.encode("utf-8"))
+        os.replace(tmp, path)
+    writable = bool(os.stat(path).st_mode & 0o200)
+    if writable == pin:              # 开着汉化要只读，关了要可写
+        os.chmod(path, 0o444 if pin else 0o666)
+        if pin:
+            did.add("readonly")
+    return did
 
 
 def find_riot_client() -> Path | None:
@@ -1947,7 +2027,8 @@ def league_client_running() -> bool:
 
 
 class LocaleKeeper:
-    """汉化开着的时候每 3 秒看一眼语言设置，Riot 客户端（更新 / 修复 / 改设置）改回去了就再改成 zh_CN。
+    """汉化开着的时候把语言设置固定成 zh_CN（见 write_game_locale 的 pin），并且每 3 秒看一眼：
+    Riot 客户端（更新 / 修复 / 改设置）要是还是改回去了，就再改成 zh_CN、重新固定住。
     改的那一刻客户端开着的话，这次不生效、要重开客户端：窗口上一直提示，直到客户端关掉"""
 
     def __init__(self, config: dict):
@@ -1971,8 +2052,9 @@ class LocaleKeeper:
                 self._apply()
             else:
                 back = self.config.pop("locale_before", None) or default_game_locale()
+                ours = ZH_LOCALE if self.config.pop("locale_listed", None) else ""    # 名单里的 zh_CN 是我们加的才拿掉
                 try:
-                    if cur and write_game_locale(back):
+                    if cur and write_game_locale(back, unlist=ours):
                         logger.info(f"已关闭简中汉化，游戏语言恢复成 {back}")
                         self.changed_while_client_open = league_client_running()
                     self.last_error = ""
@@ -1992,10 +2074,17 @@ class LocaleKeeper:
             if cur is None:
                 self.last_error = "没找到英雄联盟的语言设置（游戏装了吗？）"
                 return
-            if write_game_locale(ZH_LOCALE):
+            did = write_game_locale(ZH_LOCALE, pin=True)
+            if "listed" in did and not self.config.get("locale_listed"):
+                self.config["locale_listed"] = True          # 关掉汉化时把它从名单里拿掉
+                save_config(self.config)
+            if "locale" in did:
                 self.changed_while_client_open = league_client_running()
                 logger.info(f"游戏语言 {cur} → {ZH_LOCALE}（简体中文文字和语音）"
                             + ("，客户端开着，重开一次客户端后生效" if self.changed_while_client_open else ""))
+            if did - {"locale"}:
+                logger.info("简中汉化：已经把语言设置固定住（简体中文加进了游戏认可的语言名单，设置文件设成只读），"
+                            "Riot 客户端启动时不会再把语言改回去，简体中文的语言包也就不用每次重新下载了")
             self.last_error = ""
         except Exception as e:
             msg = f"改语言失败：{e}"
