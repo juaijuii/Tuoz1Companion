@@ -48,15 +48,33 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.9.7"
+VERSION = "1.9.8"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
 IS_WINDOWS = sys.platform.startswith("win")
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 APP_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else Path(__file__).resolve().parent
-CONFIG_PATH = APP_DIR / "companion_config.json"
-LOG_PATH = APP_DIR / "companion.log"
+
+
+def data_dir(frozen: bool, appdata: str | None, app_dir: Path) -> Path:
+    """配置文件放在哪个文件夹。打包好的 exe：固定放在 %APPDATA%\\Tuoz1Companion（每个 Windows 用户一份）——
+    以前和 exe 放在一起，exe 挪个地方（从「下载」拖到桌面）配置就读不到了，令牌要重新输。
+    那个文件夹建不出来、或者是源码运行：还是和程序放在一起"""
+    if frozen and appdata:
+        folder = Path(appdata) / "Tuoz1Companion"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            return folder
+        except OSError:
+            pass
+    return app_dir
+
+
+DATA_DIR = data_dir(IS_WINDOWS and IS_FROZEN, os.environ.get("APPDATA"), APP_DIR)
+CONFIG_PATH = DATA_DIR / "companion_config.json"
+OLD_CONFIG_PATH = APP_DIR / "companion_config.json"      # v1.9.7 及更早：配置和 exe 放在一起
+LOG_PATH = APP_DIR / "companion.log"                     # 日志还是和 exe 放在一起
 
 UPDATE_REPO = "juaijuii/Tuoz1Companion"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
@@ -81,10 +99,34 @@ logger = logging.getLogger("tuoz1-companion")
 # ----------------------------------------------------------------------------
 # 配置
 # ----------------------------------------------------------------------------
+def migrate_config(old: Path | None = None, new: Path | None = None) -> str:
+    """把以前放在 exe 旁边的配置搬到固定的位置。返回 none（没有老配置，或者位置没变）/ kept（新位置已经有了，以它为准）
+    / moved / failed。搬过去以后把老的那份删掉：留着的话，有人照老习惯去改它，会发现怎么改都不生效"""
+    old, new = old or OLD_CONFIG_PATH, new or CONFIG_PATH
+    try:
+        if os.path.normcase(str(old)) == os.path.normcase(str(new)) or not old.is_file():
+            return "none"
+        if new.exists():
+            return "kept"
+        tmp = new.with_suffix(".json.tmp")
+        tmp.write_bytes(old.read_bytes())
+        os.replace(tmp, new)
+    except OSError:
+        return "failed"
+    try:
+        old.unlink()
+    except OSError:
+        pass                                              # 删不掉不要紧：以后只读新位置那份
+    return "moved"
+
+
 def load_config() -> dict:
-    if CONFIG_PATH.exists():
+    # 新位置没有、老位置（exe 旁边）有：读老的（搬家那一步万一没成，令牌也不会丢）
+    for path in (CONFIG_PATH, OLD_CONFIG_PATH):
+        if not path.exists():
+            continue
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
                 return data
@@ -5550,7 +5592,12 @@ def main() -> int:
         return ocr_selftest()
 
     setup_logging(args.verbose)
+    moved = migrate_config()
     logger.info(f"{APP_NAME} v{VERSION} — Tuoz1 Bot 客户端插件  (配置: {CONFIG_PATH})")
+    if moved == "moved":
+        logger.info(f"配置文件搬到了 {CONFIG_PATH}：以后把插件挪到别的文件夹，不用再重新输入令牌")
+    elif moved == "failed":
+        logger.warning(f"配置文件没能搬到 {DATA_DIR}，这次还用 exe 旁边的那份")
     ensure_desktop_shortcut(load_config())
     if ensure_elevated(args):
         return 0
