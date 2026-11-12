@@ -48,7 +48,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.9.8"
+VERSION = "1.9.9"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -57,29 +57,80 @@ IS_FROZEN = bool(getattr(sys, "frozen", False))
 APP_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else Path(__file__).resolve().parent
 
 
-def data_dir(frozen: bool, appdata: str | None, app_dir: Path) -> Path:
+CONFIG_NAME = "companion_config.json"
+
+
+def _argv_value(argv, name: str) -> str:
+    """解析命令行之前先从参数里找一个带值的开关（--名字 值，或者 --名字=值）。没有返回空串"""
+    argv = list(argv)
+    for i, a in enumerate(argv):
+        if a == name and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(name + "="):
+            return a[len(name) + 1:]
+    return ""
+
+
+def _has_token(path: Path) -> bool:
+    """这份配置文件里有没有令牌（读不了、不是配置都算没有）"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return isinstance(data, dict) and bool(data.get("token"))
+    except Exception:
+        return False
+
+
+def data_dir(frozen: bool, appdata: str | None, app_dir: Path, given: str = "") -> Path:
     """配置文件放在哪个文件夹。打包好的 exe：固定放在 %APPDATA%\\Tuoz1Companion（每个 Windows 用户一份）——
     以前和 exe 放在一起，exe 挪个地方（从「下载」拖到桌面）配置就读不到了，令牌要重新输。
-    那个文件夹建不出来、或者是源码运行：还是和程序放在一起"""
-    if frozen and appdata:
-        folder = Path(appdata) / "Tuoz1Companion"
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-            return folder
-        except OSError:
-            pass
+    given：命令行 --data-dir 给的位置，重新启动自己（申请管理员权限、自动更新）时原来的进程告诉新进程的，有就先用它。
+    平时用普通账号、确认框里输另一个管理员账号密码的电脑上，开出来的那个进程自己的 %APPDATA% 是那个管理员的，
+    不告诉它的话它找不到原来的进程刚搬过去的配置，又要输一次令牌。
+    例外：given 里没有令牌、自己的 %APPDATA% 里有——v1.9.8 没带这个参数，这种电脑上令牌已经存在管理员那边了，接着用那份。
+    固定位置建不出来、或者是源码运行：还是和程序放在一起"""
+    if frozen:
+        own = Path(appdata) / "Tuoz1Companion" if appdata else None
+        folders = [Path(given)] if given else []
+        if own and folders and not _has_token(folders[0] / CONFIG_NAME) and _has_token(own / CONFIG_NAME):
+            folders = [own]
+        elif own:
+            folders.append(own)
+        for folder in folders:
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+                return folder
+            except OSError:
+                pass
     return app_dir
 
 
-DATA_DIR = data_dir(IS_WINDOWS and IS_FROZEN, os.environ.get("APPDATA"), APP_DIR)
-CONFIG_PATH = DATA_DIR / "companion_config.json"
-OLD_CONFIG_PATH = APP_DIR / "companion_config.json"      # v1.9.7 及更早：配置和 exe 放在一起
+DATA_DIR = data_dir(IS_WINDOWS and IS_FROZEN, os.environ.get("APPDATA"), APP_DIR, _argv_value(sys.argv[1:], "--data-dir"))
+CONFIG_PATH = DATA_DIR / CONFIG_NAME
+OLD_CONFIG_PATH = APP_DIR / CONFIG_NAME                  # v1.9.7 及更早：配置和 exe 放在一起
 LOG_PATH = APP_DIR / "companion.log"                     # 日志还是和 exe 放在一起
+HANDOVER_PATH = DATA_DIR / "companion_handover.json"     # 让位给管理员身份的自己时，没报完的战绩先存在这儿（见 Companion.save_handover）
+
+
+def carry_args(argv) -> list:
+    """重新启动自己（申请管理员权限、自动更新后重启）时带下去的参数：原来的参数，加上配置放在哪个文件夹"""
+    out, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+        elif a == "--data-dir":
+            skip = True
+        elif not a.startswith("--data-dir="):
+            out.append(a)
+    if DATA_DIR != APP_DIR:
+        out += ["--data-dir", str(DATA_DIR)]
+    return out
 
 UPDATE_REPO = "juaijuii/Tuoz1Companion"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_ASSET = "Tuoz1Companion.exe"
 UPDATE_CHECK_SECONDS = 30 * 60      # 闲着的时候多久看一次有没有新版本（另外每打完一局、战绩报完以后马上看一次）
+UPDATE_RETRY_MAX_SECONDS = 6 * 3600 # 同一个版本更新失败以后越隔越久才再试（半小时、1 小时、2 小时……），最久隔这么久
 # 这些阶段不更新（更新要重启插件，几秒钟里什么都干不了）：排到了等确认、选人、读条、对局中、等结算
 UPDATE_BUSY_PHASES = {"ReadyCheck", "ChampSelect", "GameStart", "InProgress", "Reconnect", "WaitingForStats", "PreEndOfGame"}
 IN_GAME_PHASES = {"InProgress", "Reconnect"}
@@ -91,6 +142,7 @@ RETRY_WINDOW_SECONDS = 30 * 60       # 不在语音频道时，最多等 30 分�
 FAIL_RETRY_WINDOW_SECONDS = 2 * 3600 # 上传失败（机器人重启 / 网络）时最多等 2 小时补报
 RETRY_INTERVAL_SECONDS = 60          # 补报重试间隔（不跟随游戏结束后的快速轮询）
 STALE_HISTORY_SECONDS = 12 * 3600    # 战绩列表里的「最新一场」超过这么久就不补报了（只记成基线）
+HANDOVER_WATCH_SECONDS = 120         # 刚启动的这段时间看有没有另一个自己（普通权限的那个）让位时留下来的战绩
 PHASE_POLL_SECONDS = 3
 
 logger = logging.getLogger("tuoz1-companion")
@@ -684,9 +736,17 @@ def download_file(url: str, dest: Path, expected_size: int = 0) -> None:
             raise RuntimeError("下载的文件不是 Windows 可执行文件")
 
 
+_update_failed = {"tag": "", "times": 0, "retry_at": 0.0}      # 这次运行里哪个版本更新失败过、失败了几次、什么时候再试
+
+
 def check_for_update(enabled: bool = True) -> bool:
     """有新版本时下载并切换到新版本（返回 True 表示当前进程应立即退出）"""
     if not enabled:
+        return False
+    if elevation_pending():
+        # 申请管理员权限的确认框还挂着：这时候更新会再开出一个新进程、再弹一个确认框，
+        # 两个都点「是」就是两个管理员身份的插件一起跑
+        logger.debug("管理员权限的确认框还没人点，先不检查更新")
         return False
     try:
         latest = fetch_latest_release()
@@ -699,11 +759,28 @@ def check_for_update(enabled: bool = True) -> bool:
     if parse_version(tag) <= parse_version(VERSION):
         logger.debug(f"已是最新版本（{VERSION}，最新 {tag}）")
         return False
-    if not IS_FROZEN:
-        logger.info(f"有新版本 {tag}（当前 {VERSION}），源码运行不会自动替换，请到 GitHub 下载：{url}")
+    # 同一个版本这次运行里已经失败过：还没到再试的时候就不试；再失败也只记在详细日志里。
+    # 换不了文件的人（只读文件夹、杀毒软件拦着）不能每半小时刷一次报错、重下一遍四十多 MB
+    again = _update_failed["tag"] == tag
+    if again and time.time() < _update_failed["retry_at"]:
+        return False
+    info = logger.debug if again else logger.info
+    error = logger.debug if again else logger.error
+
+    def failed(quiet: bool = False) -> bool:
+        times = _update_failed["times"] + 1 if again else 1
+        wait = min(UPDATE_RETRY_MAX_SECONDS, UPDATE_CHECK_SECONDS * 2 ** (times - 1))
+        _update_failed.update(tag=tag, times=times, retry_at=time.time() + wait)
+        if not again and not quiet:
+            logger.info(f"之后还会自己再试更新到 {tag}（隔得越来越久），再不成功不再重复提示；重新打开插件会马上再试一次。"
+                        f"一直不成功的话，到 https://github.com/{UPDATE_REPO}/releases/latest 下载新版本换掉现在这个")
         return False
 
-    logger.info(f"发现新版本 {tag}（当前 {VERSION}），正在下载更新...")
+    if not IS_FROZEN:
+        info(f"有新版本 {tag}（当前 {VERSION}），源码运行不会自动替换，请到 GitHub 下载：{url}")
+        return failed(quiet=True)
+
+    info(f"发现新版本 {tag}（当前 {VERSION}），正在下载更新...")
     exe = Path(sys.executable)
     new_file = exe.with_suffix(".new.exe")
     old_file = exe.with_suffix(".old.exe")
@@ -714,7 +791,7 @@ def check_for_update(enabled: bool = True) -> bool:
         os.rename(exe, old_file)      # Windows 允许给正在运行的 exe 改名
         os.rename(new_file, exe)
     except Exception as e:
-        logger.error(f"更新失败，继续使用当前版本: {e}")
+        error(f"更新失败，继续使用当前版本: {e}")
         # 回滚的两步分开 try：以前删 .new 失败（杀软锁文件）就跳过了「把旧 exe 改回来」，插件本体直接没了
         try:
             if new_file.exists():
@@ -726,11 +803,11 @@ def check_for_update(enabled: bool = True) -> bool:
                 os.rename(old_file, exe)
         except OSError as e2:
             logger.error(f"把旧版本改回原名失败，请手动把 {old_file.name} 改成 {exe.name}: {e2}")
-        return False
+        return failed()
 
     logger.info(f"已更新到 {tag}，正在重新启动...")
     try:
-        args = [str(exe)] + [a for a in sys.argv[1:] if a != "--send-latest"]
+        args = [str(exe)] + carry_args([a for a in sys.argv[1:] if a != "--send-latest"])
         # PyInstaller 会把 _PYI_ARCHIVE_FILE / _MEIPASS2 等变量留在环境里，新版本继承后会去找已被改名的旧文件而直接退出，
         # 这里从当前进程环境里彻底删掉（本进程已经解包完成，不再需要它们）
         for key in list(os.environ):
@@ -751,7 +828,7 @@ def check_for_update(enabled: bool = True) -> bool:
             time.sleep(2)
     except Exception as e:
         logger.error(f"启动新版本失败，请手动双击 {exe.name}: {e}")
-        return False
+        return failed(quiet=True)
     return True
 
 
@@ -893,6 +970,24 @@ def ensure_desktop_shortcut(config: dict, exe: Path | None = None, desktop: Path
 # ----------------------------------------------------------------------------
 ELEVATE_LINGER_SECONDS = 6      # 申请到权限、开出管理员身份的自己以后，原来这个进程再留这么久才退出（比自动更新盯的 3 秒长）
 ELEVATE_WAIT_SECONDS = 20       # 确认框最多等这么久；还没人点（自动更新后弹的框常常只在任务栏里闪，人在打游戏根本没看见）就先照常运行
+_elevation = {"pending": False, "handover": None}
+# pending：主线已经不等确认框了，但确认框还挂着没人点。这期间不自动更新（见 check_for_update）
+# handover：让位给管理员身份的自己之前要做的事（Companion 建好以后填上：把只在内存里的东西存下来）
+
+
+def elevation_pending() -> bool:
+    """确认框还挂着没人点、这个进程先以普通权限运行着"""
+    return bool(_elevation["pending"])
+
+
+def _hand_over() -> None:
+    """让位（os._exit，不做任何收尾）之前：把只在内存里的东西存下来。出什么错都不能挡住让位"""
+    try:
+        hook = _elevation.get("handover")
+        if hook:
+            hook()
+    except Exception as e:
+        logger.debug(f"让位前存东西出错: {e}")
 
 
 def relaunch_elevated(argv: list) -> str:
@@ -940,17 +1035,19 @@ def ensure_elevated(args) -> bool:
         # 弹确认框这一步会一直卡到有人点为止，所以放在另一条线上：以前在主线上等，
         # 确认框没人点（自动更新完弹的框只在任务栏里闪）的话插件就一直停在这儿，什么都不干
         try:
-            result = relaunch_elevated(sys.argv[1:] + ["--elevated"])
+            result = relaunch_elevated(carry_args(sys.argv[1:]) + ["--elevated"])
         except Exception as e:
             logger.debug(f"申请管理员权限出错: {e}")
             result = "failed"
         with guard:
             state["result"] = result
             late = state["late"]
+            _elevation["pending"] = False
         if not late:
             return                                    # 主线还在等：结果交给它处理
         if result == "started":
             logger.info("拿到管理员权限了，换成管理员身份的那个接着运行")
+            _hand_over()
             os._exit(0)                               # 这个进程已经在照常干活了：直接让位，免得两个插件一起报战绩
         logger.warning(denied)
 
@@ -961,6 +1058,7 @@ def ensure_elevated(args) -> bool:
         result = state["result"]
         if result is None:
             state["late"] = True
+            _elevation["pending"] = True
     if result is None:
         logger.info("确认框还没有人点（可能在任务栏里闪，点一下那个盾牌图标再点「是」）。插件先照常运行，"
                     "点了「是」以后会自动换成管理员身份")
@@ -1070,6 +1168,8 @@ class Companion:
         self.next_retry_check = 0.0                        # 补报（不在语音频道）的下一次尝试时间，固定 60 秒间隔
         self.next_update_check = time.time() + UPDATE_CHECK_SECONDS
         self.update_after_game = False             # 刚打完一局：战绩报完、回到大厅以后马上看一次有没有新版本
+        self.handover_until = time.time() + HANDOVER_WATCH_SECONDS      # 刚启动的这段时间看有没有另一个自己留下来的战绩
+        _elevation["handover"] = self.save_handover
         self.config.setdefault("last_game_ids", {})
         self.config.setdefault("sent_game_ids", [])
 
@@ -1617,12 +1717,85 @@ class Companion:
             return "retry"        # 有一个服务器还没进语音就继续补报；已经播过的服务器会回 already_processed，无害
         return True
 
+    # --- 让位（见 ensure_elevated）：普通权限的自己退出前把没报完的战绩交给管理员身份的自己 ---
+    def save_handover(self) -> int:
+        """把只在内存里、退出就丢的东西存下来：配置、补报队列、还在等战绩的对局（连同已经拿到的赛后统计）。
+        在申请权限的那条线上调用，主循环可能正在改这些表，所以每样都先抄一份再用。返回存了几局"""
+        try:
+            save_config(self.config)                # 窗口上的开关是「先改内存、后台再存」
+        except Exception:
+            pass
+        retries = {str(g): [payload, match_id, deadline]
+                   for g, (payload, match_id, deadline) in list(dict(self.retry_uploads).items())}
+        pending = [g for g in list(self.pending_game_ids) if str(g) not in retries]
+        if not retries and not pending:
+            return 0
+        eog_cache = dict(self.eog_cache)
+        data = {"saved_at": time.time(), "version": VERSION, "retries": retries, "pending": pending,
+                "eog_cache": {str(g): eog_cache[g] for g in pending if g in eog_cache},
+                "post_game_deadline": self.post_game_deadline, "eog_wait_until": self.eog_wait_until}
+        tmp = HANDOVER_PATH.with_suffix(".json.tmp")  # 管理员身份的那个用的是同一个文件夹（提权时带过去的，见 carry_args）
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, HANDOVER_PATH)
+        logger.info(f"还有 {len(retries) + len(pending)} 局战绩没报完，已经交给管理员身份的那个接着报")
+        return len(retries) + len(pending)
+
+    def take_handover(self) -> int:
+        """接手另一个自己留下来的战绩（它让位退出前存的）。返回接手了几局"""
+        try:
+            if not HANDOVER_PATH.exists():
+                return 0
+            with open(HANDOVER_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            HANDOVER_PATH.unlink()
+        except Exception as e:
+            logger.debug(f"读 {HANDOVER_PATH} 出错: {e}")
+            try:
+                HANDOVER_PATH.unlink()
+            except OSError:
+                pass
+            return 0
+        if not isinstance(data, dict):
+            return 0
+        taken, now = 0, time.time()
+        for g, item in (data.get("retries") or {}).items():
+            try:
+                game_id, (payload, match_id, deadline) = int(g), item
+                deadline = float(deadline)
+            except (TypeError, ValueError):
+                continue
+            if deadline > now and not self.already_sent(game_id) and game_id not in self.retry_uploads:
+                self.retry_uploads[game_id] = (payload, match_id, deadline)
+                self.next_retry_check = 0.0
+                taken += 1
+        if now - float(data.get("saved_at") or 0) <= POST_GAME_WINDOW_SECONDS:    # 太久以前留下的：等战绩的那几局早过了时限
+            for g in data.get("pending") or []:
+                if not isinstance(g, int) or self.already_sent(g) or g in self.pending_game_ids or g in self.retry_uploads:
+                    continue
+                self.pending_game_ids.append(g)
+                taken += 1
+                stats = (data.get("eog_cache") or {}).get(str(g))
+                if stats and g not in self.eog_cache:
+                    self.eog_cache[g] = stats
+            if data.get("pending"):
+                self.post_game_deadline = max(self.post_game_deadline, float(data.get("post_game_deadline") or 0))
+                self.eog_wait_until = max(self.eog_wait_until, float(data.get("eog_wait_until") or 0))
+                self.next_history_check = 0.0
+        if taken:
+            logger.info(f"接手了 {taken} 局没报完的战绩（普通权限的那个插件退出前留下的），接着报")
+        return taken
+
     def update_due(self, now: float, phase: str) -> bool:
         """现在该不该去看有没有新版本。两个时机：刚打完一局（战绩报完以后），或者闲着满了 UPDATE_CHECK_SECONDS。
         忙的时候不看——更新要重启插件：选人时侧栏会没掉，对局中标注会没掉；战绩还没报完的话重启会把它丢了。
         排队时可以更新，但开着「自动接受对局」的人不行（重启那几秒正好排到就接不上了）"""
         if phase in UPDATE_BUSY_PHASES or self.pending_game_ids or self.retry_uploads:
             return False
+        if elevation_pending():
+            return False                # 管理员权限的确认框还挂着：先不看，也不把这次机会用掉，等它有了结果马上看
         if phase == "Matchmaking" and getattr(getattr(self, "accepter", None), "enabled", False):
             return False
         return self.update_after_game or now >= self.next_update_check
@@ -1632,6 +1805,11 @@ class Companion:
         interval = max(15, int(self.args.interval))
         while True:
             now = time.time()
+            if now < self.handover_until:
+                try:
+                    self.take_handover()
+                except Exception as e:
+                    logger.debug(f"接手战绩出错: {e}")
             self.process_retries()          # 补报不依赖客户端：打完就关客户端的人，进语音后照样能补播
             if self.lcu is None:
                 if not self.connect_lcu():
@@ -5585,6 +5763,7 @@ def main() -> int:
     parser.add_argument("--ocr-selftest", action="store_true", help="检查本机认字能不能用（模型和运行库在不在），然后退出")
     parser.add_argument("--no-elevate", action="store_true", help="启动时不申请管理员权限（对局里按住 Tab 看出装可能没反应）")
     parser.add_argument("--elevated", action="store_true", help=argparse.SUPPRESS)    # 申请权限之后开出来的那个自己带着它
+    parser.add_argument("--data-dir", help=argparse.SUPPRESS)       # 配置放哪：重新启动自己时带下去的（见 carry_args），文件开头就已经读过了
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
