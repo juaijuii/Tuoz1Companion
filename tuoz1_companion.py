@@ -49,7 +49,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -1297,6 +1297,7 @@ class Companion:
         self.bot = bot
         self.args = args
         self.lcu: LCU | None = None
+        self.lcu_found = None                      # (端口, 密码)，连上客户端时记下
         self.summoner: dict = {}
         self.champions: dict[str, str] = {}
         self.bindings: list[dict] = []
@@ -1370,6 +1371,7 @@ class Companion:
             logger.debug(f"客户端尚未就绪: {e}")
             return False
         self.lcu = lcu
+        self.lcu_found = found                     # 头像墙（彩蛋功能）连客户端时直接用这一份，不用自己再找
         self.summoner = summoner
         name = summoner.get("gameName") or summoner.get("displayName") or "?"
         tag = summoner.get("tagLine") or ""
@@ -3288,6 +3290,92 @@ def collect_player_stats(lcu, teams: list, game_id=None, on_update=None) -> list
     with ThreadPoolExecutor(max_workers=5) as pool:
         list(pool.map(fetch, jobs))
     return player_stat_rows(done)
+
+
+# ----------------------------------------------------------------------------
+# 彩蛋功能：头像墙
+# ----------------------------------------------------------------------------
+# avatar_wall/ 里是一个本来单独运行的小工具：从客户端自带的头像里挑一个换上（包括没拥有的），被客户端改回去就再设一次。
+# 界面是网页，用电脑自带的 Edge 开成独立窗口。插件只在点了「彩蛋功能」时才加载它；
+# 上次挑过头像、又开着「被改回就重设」的，插件启动时在后台接着重设（不开窗口）。
+# 它会改客户端里的东西（聊天资料里的头像；自己有的头像连账号头像），所以放在彩蛋里、默认什么都不做。
+# 独立版还能改 Riot ID，那是真的改账号，插件这一份不带（avatar_wall/ 是独立版去掉改名以后生成的，不要直接改这里）
+_wall = {"obj": None, "module": None, "tried": False}
+_WALL_GUARD = threading.Lock()
+
+
+def avatar_wall_dir() -> Path:
+    return DATA_DIR / "avatar_wall"
+
+
+def avatar_wall(companion=None):
+    """头像墙（第一次用的时候才加载）。加载不了返回 None，原因记在日志里"""
+    with _WALL_GUARD:
+        if _wall["obj"] is None and not _wall["tried"]:
+            _wall["tried"] = True
+            try:
+                from avatar_wall import avatar_picker
+                avatar_picker.set_data_dir(avatar_wall_dir())
+                _wall["module"], _wall["obj"] = avatar_picker, avatar_picker.Wall()
+            except Exception as e:
+                logger.warning(f"头像墙加载不了: {type(e).__name__}: {e}")
+        if _wall["module"] is not None and companion is not None:
+            # 客户端在哪由插件告诉它：插件本来就盯着客户端
+            _wall["module"].find_client = lambda: companion.lcu_found if companion.lcu is not None else None
+        return _wall["obj"]
+
+
+def open_avatar_wall(companion) -> str:
+    """点了「彩蛋功能」：起头像墙的后台并开窗口。返回给人看的一句话"""
+    wall = avatar_wall(companion)
+    if wall is None:
+        return "头像墙打不开：这个版本里没带上它"
+    problem = wall.open()
+    if problem:
+        logger.info(f"头像墙打不开：{problem}")
+        return f"头像墙打不开：{problem}"
+    logger.info("头像墙已打开（彩蛋功能）。关掉它的窗口不影响已经换上的头像，插件开着就会一直重设")
+    return "头像墙开了，在另一个窗口里"
+
+
+def resume_avatar_wall(companion) -> None:
+    """插件启动时：上次在头像墙里挑过头像、又开着「被改回就重设」，就在后台接着重设。没用过头像墙的人这里什么都不做"""
+    try:
+        cfg_path = avatar_wall_dir() / "config.json"
+        if not cfg_path.is_file():
+            return
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict) or not isinstance(cfg.get("desired"), int) or cfg.get("auto") is False:
+            return
+        wall = avatar_wall(companion)
+        if wall is None:
+            return
+        problem = wall.start()
+        if problem:
+            logger.info(f"头像墙：没能接着重设上次挑的头像（{problem}）")
+        else:
+            logger.info(f"头像墙：接着用上次挑的 {cfg['desired']} 号头像，被客户端改回会自动重设（在「彩蛋功能」里可以换回自己的）")
+    except Exception as e:
+        logger.debug(f"头像墙：{e}")
+
+
+def avatar_wall_selftest() -> int:
+    """--avatar-wall-selftest：打包以后检查头像墙的程序和界面文件是不是都带上了。都在返回 0"""
+    try:
+        from avatar_wall import avatar_picker
+    except Exception as e:
+        print(f"AVATAR WALL FAIL: import {type(e).__name__}: {e}")
+        return 1
+    missing = [n for n in ("index.html", "app.css", "app.js", "app.json", "icon.svg") if not (avatar_picker.WEB / n).is_file()]
+    if missing:
+        print(f"AVATAR WALL FAIL: missing {missing} in {avatar_picker.WEB}")
+        return 1
+    if b"{{KEY}}" not in (avatar_picker.WEB / "index.html").read_bytes() or not hasattr(avatar_picker, "Wall"):
+        print("AVATAR WALL FAIL: unexpected files")
+        return 1
+    print(f"AVATAR WALL OK: {avatar_picker.WEB}")
+    return 0
 
 
 def history_test() -> int:
@@ -5543,6 +5631,9 @@ class AramPanel:
         self.root.after(wait, self._watch_key)
 
 
+WINDOW_MIN_H = 495              # 主窗口最矮这么高（96 DPI 下的像素）：再矮日志就只剩一两行
+
+
 class CompanionWindow:
     def __init__(self, companion, keeper: LocaleKeeper, worker: threading.Thread, log_q):
         import tkinter as tk
@@ -5561,8 +5652,8 @@ class CompanionWindow:
         self.px = max(1.0, root.winfo_fpixels("1i") / 96)
         root.title(f"托子的小警察 v{VERSION}")
         root.configure(bg=HEX["bg"])
-        root.minsize(int(380 * self.px), int(465 * self.px))
-        root.geometry(f"{int(400 * self.px)}x{int(480 * self.px)}")
+        root.minsize(int(380 * self.px), int(WINDOW_MIN_H * self.px))
+        root.geometry(f"{int(400 * self.px)}x{int((WINDOW_MIN_H + 15) * self.px)}")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._dark_title_bar()
         self._set_icon()
@@ -5723,6 +5814,20 @@ class CompanionWindow:
                 self.aram_sub_rows[key] = (box, lbl)
             self._refresh_aram_sub()
 
+        # 彩蛋功能：单独一行小字，和「细项」「完整日志」同一种小字（平时灰、鼠标移上去变金）。点了在另一个窗口里开头像墙
+        egg = tk.Frame(body, bg=HEX["bg"])
+        egg.pack(fill="x", pady=(self._p(12), 0))
+        self.egg_lbl = tk.Label(egg, text="彩蛋功能", bg=HEX["bg"], fg=HEX["muted"], font=(UI_FONT, 9), cursor="hand2")
+        self.egg_lbl.pack(side="left")
+        # 点了以后的回话就写在这一行右边（正在打开 / 开了 / 为什么打不开），几秒后自己消失
+        self.egg_msg = tk.Label(egg, text="", bg=HEX["bg"], fg=HEX["muted"], font=(UI_FONT, 9), anchor="w")
+        self.egg_msg.pack(side="left", padx=(self._p(10), 0))
+        self.egg_note = ("", 0.0, False)        # (说什么, 说到什么时候, 是不是出错)
+        self.egg_busy = False
+        self.egg_lbl.bind("<Button-1>", lambda e: self.open_egg())
+        self.egg_lbl.bind("<Enter>", lambda e: self.egg_lbl.config(fg=HEX["gold"]))
+        self.egg_lbl.bind("<Leave>", lambda e: self.egg_lbl.config(fg=HEX["muted"]))
+
         # 大按钮：金色描边。鼠标移上去描边变亮、底色提一点；按下去底色压暗；点完 8 秒内显示「启动中…」
         self.btn_frame = tk.Frame(body, bg=HEX["gold"], cursor="hand2")
         self.btn_frame.pack(fill="x", pady=(self._p(16), 0))
@@ -5802,6 +5907,28 @@ class CompanionWindow:
             self.hint_override = (msg, time.time() + 6)
         threading.Thread(target=work, daemon=True).start()
 
+    def open_egg(self):
+        """点了「彩蛋功能」：在另一个窗口里开头像墙。加载和开浏览器放后台，这边先回一句话"""
+        if self.egg_busy:
+            return
+        self.egg_busy = True
+        self.egg_note = ("正在打开头像墙…", time.time() + 20, False)
+        self._refresh_egg()
+
+        def work():
+            try:
+                msg = open_avatar_wall(self.companion)
+            except Exception as e:
+                msg = f"头像墙打不开：{type(e).__name__}"
+                logger.warning(f"{msg}: {e}")
+            self.egg_note = (msg, time.time() + 6, "打不开" in msg)      # 窗口那条线下一秒刷新时显示
+            self.egg_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _refresh_egg(self):
+        msg, until, bad = self.egg_note
+        self.egg_msg.config(text=msg if time.time() < until else "", fg=HEX["bad"] if bad else HEX["muted"])
+
     def toggle_accept(self):
         on = not self.accepter.enabled
         self.acc_box.config(text="✓" if on else "")
@@ -5839,7 +5966,7 @@ class CompanionWindow:
             self.aram_sub.pack_forget()
         width, height = root.winfo_width(), root.winfo_height()
         min_w = int(380 * self.px)
-        base_min = int(465 * self.px)
+        base_min = int(WINDOW_MIN_H * self.px)
         root.minsize(min_w, base_min + (self.aram_sub.winfo_reqheight() if self.aram_open else 0))
         for step in range(1, 5):
             root.after(step * 30, lambda s=step: root.geometry(f"{width}x{max(base_min, height + delta * s // 4)}"))
@@ -5935,6 +6062,7 @@ class CompanionWindow:
                 self.btn_frame.config(cursor="arrow" if mode == "ingame" else "hand2")
                 self._btn_look("normal")
         self._refresh_zh()
+        self._refresh_egg()
         self.root.after(1000, self._tick_state)
 
     def run(self):
@@ -5968,6 +6096,7 @@ def run_with_window(companion, keeper: LocaleKeeper) -> int:
         companion.run()
         return 0
     worker.start()
+    threading.Thread(target=resume_avatar_wall, args=(companion,), daemon=True).start()
     logger.info("窗口已打开。黑色命令行窗口已隐藏，点窗口右上角「完整日志」可以再显示。" if console_is_ours()
                 else "窗口已打开。")
     show_console(False)
@@ -5988,6 +6117,7 @@ def main() -> int:
     parser.add_argument("--import-blacklist", metavar="文件", help="批量导入黑名单：League Akari 的标记玩家导出，或带 riot_id 的 JSON 列表")
     parser.add_argument("file", nargs="?", help=argparse.SUPPRESS)   # 把文件拖到 exe 上时，路径就在这里
     parser.add_argument("--no-gui", action="store_true", help="不开窗口，只用命令行")
+    parser.add_argument("--avatar-wall-selftest", action="store_true", help="检查头像墙（彩蛋功能）的文件带没带上，然后退出")
     parser.add_argument("--ocr-selftest", action="store_true", help="检查本机认字能不能用（模型和运行库在不在），然后退出")
     parser.add_argument("--history-test", action="store_true", help="量一下查别人的战绩有多快（直连和客户端代查各几秒；客户端要开着），结果写进日志，然后退出")
     parser.add_argument("--no-elevate", action="store_true", help="启动时不申请管理员权限（对局里按住 Tab 看出装可能没反应）")
@@ -5998,6 +6128,8 @@ def main() -> int:
 
     if args.ocr_selftest:
         return ocr_selftest()
+    if args.avatar_wall_selftest:
+        return avatar_wall_selftest()
 
     setup_logging(args.verbose)
     if args.history_test:
