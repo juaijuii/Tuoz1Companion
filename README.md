@@ -67,7 +67,17 @@ pip install numpy onnxruntime
   在 `companion_config.json` 里加一行 `"direct_history": false`。想知道自己电脑上两种查法各用几秒：
   开着客户端运行 `Tuoz1Companion.exe --history-test`，结果在 `companion.log` 里。
 
-不想要窗口，加 `--no-gui` 只用命令行。
+- **彩蛋功能：头像墙**（v1.11.0）：勾选框下面有一行小字「彩蛋功能」，点一下，在另一个窗口里打开头像墙
+  （用的是电脑自带的 Edge，没有就用 Chrome；两个都没有就打不开）。
+  - 从客户端自带的五千多个头像里挑一个，点一下就换上。可以按名字或编号搜，按系列、年份筛，有收藏和最近用过。
+  - 你有的头像，连账号头像一起换。你没有的头像，只改聊天资料里显示的那个：按参考的那个工具的说法，只有好友在好友列表和
+    聊天资料卡上看得到，别处别人看到的还是你的账号头像（这一点没有实测过）。
+  - 没拥有的头像是临时的，排队、选人、开局时客户端会把它改回去。插件开着的时候，发现被改回就再设一次，连着 3 次都被改回就停手。
+    关掉头像墙的窗口不影响这个；下次打开插件也会接着重设。想停，在头像墙里点「换回我自己的头像」。
+  - 这是插件里唯一会改你客户端里东西的地方（除了「自动接受对局」）。不点「彩蛋功能」，插件不会加载它，什么都不会改。
+    这些都是 Riot 没有许可的用法，后果自负。它存的东西在配置文件夹的 `avatar_wall\` 里。
+
+不想要窗口，加 `--no-gui` 只用命令行。这个模式下没有彩蛋功能的入口，之前挑过的头像也不会重设。
 
 ## 配置文件在哪
 
@@ -138,6 +148,8 @@ python tuoz1_companion.py -v               # 详细日志
 - 海克斯数据来自 [ARAMKit](https://aramkit.com)。
 - 找游戏窗口和卡片标题位置的比例参考了 [Nyx0ra/lol-aram-mayhem-hextech-helper](https://github.com/Nyx0ra/lol-aram-mayhem-hextech-helper)（MIT）。
 - 认字用的是 PaddleOCR 的 PP-OCRv4 模型（Apache-2.0），模型文件在 `assets/ocr/`，用 onnxruntime 运行。
+- 头像墙换头像的做法参考了 [VeryVeryCoolName/league-profile-tool](https://github.com/VeryVeryCoolName/league-profile-tool)（MIT）。
+- 直连战绩服务器的做法参考了 [League Akari](https://github.com/LeagueAkari/LeagueAkari)（MIT）。
 
 ## 自己打包
 

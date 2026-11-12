@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="key" content="{{KEY}}">
+<title>头像墙</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<nav class="rail" aria-label="筛选">
+  <div class="rail-scroll">
+    <h2>看什么</h2>
+    <ul id="views">
+      <li><button type="button" data-view="all" aria-current="true"><span>全部</span><b id="n-all">–</b></button></li>
+      <li><button type="button" data-view="fav"><span>收藏</span><b id="n-fav">0</b></button></li>
+      <li><button type="button" data-view="recent"><span>最近用过</span><b id="n-recent">0</b></button></li>
+    </ul>
+    <h2>系列</h2>
+    <ul id="sets"></ul>
+    <h2>年份</h2>
+    <ul id="years"></ul>
+  </div>
+  <p class="link" id="link"><i></i><span>正在找客户端</span></p>
+</nav>
+
+<main class="work">
+  <header class="bar">
+    <label class="search">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3.5 3.5"/></svg>
+      <input id="q" type="search" placeholder="按名字或编号找，按 / 跳到这里" autocomplete="off" spellcheck="false" aria-label="按名字或编号找头像">
+    </label>
+    <select id="view-select" class="narrow-only" aria-label="看什么"><option value="all">全部</option><option value="fav">收藏</option><option value="recent">最近用过</option></select>
+    <select id="set-select" class="narrow-only" aria-label="系列"></select>
+    <select id="year-select" class="narrow-only" aria-label="年份"></select>
+    <div class="chips" id="chips"></div>
+    <b class="count" id="count" aria-live="polite"></b>
+  </header>
+  <div class="wall" id="wall">
+    <div class="spacer" id="spacer"><div class="grid" id="grid"></div></div>
+    <div class="empty" id="empty" hidden></div>
+  </div>
+</main>
+
+<aside class="insp" aria-label="正在用的头像">
+  <h2>正在用</h2>
+  <div class="face" id="face"><span id="cur-none">没有头像可显示</span></div>
+  <h3 id="cur-name">&nbsp;</h3>
+  <dl>
+    <div><dt>编号</dt><dd class="num" id="cur-id">–</dd></div>
+    <div><dt>年份</dt><dd class="num" id="cur-year">–</dd></div>
+    <div><dt>系列</dt><dd id="cur-set">–</dd></div>
+    <div><dt>拥有</dt><dd id="cur-own">–</dd></div>
+    <div><dt>谁看得到</dt><dd id="cur-who">–</dd></div>
+    <div><dt>状态</dt><dd id="cur-status"><span class="st" data-st="no_client">正在找客户端</span></dd></div>
+    <div><dt><label for="auto">被改回就重设</label></dt><dd><button type="button" class="sw" id="auto" role="switch" aria-checked="true"><i></i></button></dd></div>
+  </dl>
+  <h2 class="log-head">记录<b id="n-reset" hidden></b></h2>
+  <ol class="log" id="log"></ol>
+  <p class="log-empty" id="log-empty">还没有记录。在墙上点一个头像就换上，之后每次被客户端改回、重设，都会记在这里。</p>
+  <button type="button" class="restore" id="restore" disabled>换回我自己的头像</button>
+</aside>
+
+<script src="app.js" defer></script>
+</body>
+</html>

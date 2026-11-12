@@ -52,10 +52,14 @@ jobs:
         run: python -c "import http.client, inspect; assert '_create_connection' in inspect.getsource(http.client.HTTPConnection.connect)"
 
       - name: 打包 exe
-        run: python -m PyInstaller --onefile --console --clean --name Tuoz1Companion --icon tuoz1.ico --add-data "tuoz1.ico;." --add-data "assets/ocr/ch_PP-OCRv4_rec_infer.onnx;assets/ocr" --collect-binaries onnxruntime tuoz1_companion.py
+        run: python -m PyInstaller --onefile --console --clean --name Tuoz1Companion --icon tuoz1.ico --add-data "tuoz1.ico;." --add-data "assets/ocr/ch_PP-OCRv4_rec_infer.onnx;assets/ocr" --add-data "avatar_wall/web;web" --collect-binaries onnxruntime tuoz1_companion.py
 
       - name: 自检 exe 能启动
         run: dist\Tuoz1Companion.exe --help
+
+      # 头像墙（彩蛋功能）的程序和界面文件没打进去的话这一步会失败
+      - name: 自检头像墙的文件都带上了
+        run: dist\Tuoz1Companion.exe --avatar-wall-selftest
 
       # 模型或运行库没打进去的话这一步会失败，不会发出一个认不了字的版本
       - name: 自检本机认字能用
