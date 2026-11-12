@@ -23,6 +23,11 @@ from pathlib import Path
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")     # GitHub 打包机的控制台不是 UTF-8，打印中文会直接报错
+except Exception:
+    pass
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import tuoz1_companion as plugin  # noqa: E402  版本号、被签名内容的拼法、公钥都以插件源码为准
