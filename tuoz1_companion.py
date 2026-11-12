@@ -31,6 +31,8 @@ import argparse
 import base64
 import difflib
 import gzip
+import hashlib
+import hmac
 import http.client
 import json
 import logging
@@ -49,7 +51,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -788,6 +790,10 @@ class BotAPI:
         self.config: dict | None = None    # main() 填上以后，ping 时顺带报开关状态；没填就不报
         self.gui = False
 
+    def release(self) -> dict:
+        """最新版本的签名清单（问不到 GitHub 时的退路，见 check_for_update）"""
+        return _http_json("GET", self.server + "/api/companion/release", self.headers, timeout=20) or {}
+
     def ping(self, game_name: str = "", tag_line: str = "") -> dict:
         # 机器人第一次响应时要去数据库拉每个服务器的绑定，可能要几十秒
         url = self.server + "/api/companion/ping"
@@ -867,27 +873,95 @@ def fetch_latest_release() -> tuple[str, str, int] | None:
     return None
 
 
-def download_file(url: str, dest: Path, expected_size: int = 0) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": f"tuoz1-companion/{VERSION}"})
+# ---- 从机器人更新时的验签 ----
+# 有些玩家的电脑上，插件连不上 GitHub（浏览器能上、插件不行：装过给 GitHub「加速」的工具、代理、安全软件……），
+# 但连得上机器人。这时候改从机器人问最新版本、下载安装包。
+# 机器人走的是明文 HTTP，下载下来的东西还要以管理员身份运行，所以不能光信机器人：每个发布的 exe 都在 GitHub 打包时
+# 用私钥签过名（tools/sign_release.py，私钥是仓库的 Actions 密钥），这里用内置的公钥验。签名或文件对不上就不更新。
+# 做法和国服插件一样，密钥是另一把
+RELEASE_PUBKEY_N = int("c2b633b0e0b62b2d678296b9a59dee302d069e4205039ca89de91e7f4377e3aded81348a425f4771860682f2e08e4db884899e5cd8c352c0005f11b6c0d5d758eaaed85e07f1af2612f49409ea83dfc5f84cbb51152396f2d6008aa955e91cbe35710be0d4bf47ea87448b6d3c9b93655a2c5acda9d48b893946b05f6318d4ac0bc2018d58939ce0dc25e5f04e8b63e4dfe51f566a8b460f2057b218a5b50e2fe9fe3fef2f1e6f09e1e334952ffc54ea32f3d1ababb55250fa0625d9350844d55b77be97d80d2183e7348517e73a5fb791abcabe7799709e4933edb0c0481ea675e54a5dc8d326552a706898939ac3f2bdafe8869e888dba042b9a58f5fdd9c940a02f8255fe4d63d1ec77b82bd222879944b99f34e8dec06a5a66d89c7cceba37bfb4ff0d352b4d45a374898dc59eefec0aef19f82ae73db3dd92209d8a9ad7e1c9e8fe87e3677eb9dca38e7190824cf0f6bae42d017a0e57799eb9c29399025c8283b90b96ffbba09a3016161202ac5915457477de3de8538348b49ebe8ac3", 16)
+RELEASE_PUBKEY_E = 65537
+_SHA256_DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+def release_message(version: str, size: int, sha256: str) -> bytes:
+    """被签名的内容。tools/sign_release.py 必须用完全相同的拼法"""
+    return f"tuoz1-dc-release|{version}|{size}|{sha256}".encode("utf-8")
+
+
+def verify_signed(message: bytes, sig_hex: str) -> bool:
+    """RSA PKCS#1 v1.5 + SHA-256 验签。纯 Python 实现，不需要额外的库。
+    整段按标准格式重新拼出来再逐字节比较（不去解析签名里的结构），避免解析类的伪造漏洞"""
+    try:
+        n, e = RELEASE_PUBKEY_N, RELEASE_PUBKEY_E
+        k = (n.bit_length() + 7) // 8
+        sig = int(str(sig_hex), 16)
+        if not 0 < sig < n or len(str(sig_hex)) > 2 * k:
+            return False
+        em = pow(sig, e, n).to_bytes(k, "big")
+        tail = _SHA256_DIGEST_INFO + hashlib.sha256(message).digest()
+        expected = b"\x00\x01" + b"\xff" * (k - 3 - len(tail)) + b"\x00" + tail
+        return hmac.compare_digest(em, expected)
+    except Exception:
+        return False
+
+
+def fetch_release_from_bot(bot) -> dict | None:
+    """问机器人最新版本。返回 {version, size, sha256, sig, url}；机器人说没有、或者信息不全，返回 None。
+    签名在这里就验：验不过的清单当作没有"""
+    data = bot.release()
+    if not isinstance(data, dict) or not data.get("ok"):
+        return None
+    try:
+        version, size = str(data["version"]).lstrip("v"), int(data["size"])
+        sha256, sig, path = str(data["sha256"]).lower(), str(data["sig"]), str(data["path"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if size <= 0 or not re.fullmatch(r"[0-9a-f]{64}", sha256) or not re.fullmatch(r"/api/companion/download/[A-Za-z0-9._-]+", path):
+        return None
+    if not verify_signed(release_message(version, size, sha256), sig):
+        raise RuntimeError("机器人给的更新清单签名不对")
+    return {"version": version, "size": size, "sha256": sha256, "sig": sig, "url": bot.server + path}
+
+
+def _why(e: Exception) -> str:
+    """一次联网失败的原因，短短一句（给普通日志看的）"""
+    if isinstance(e, HttpError):
+        return f"HTTP {e.status}"
+    reason = getattr(e, "reason", None)
+    text = str(reason if reason is not None else e).strip()
+    return (text or type(e).__name__)[:90]
+
+
+def download_file(url: str, dest: Path, expected_size: int = 0, headers: dict | None = None, expected_sha256: str = "") -> None:
+    req = urllib.request.Request(url, headers={"User-Agent": f"tuoz1-companion/{VERSION}", **(headers or {})})
+    digest = hashlib.sha256()
     with _open(req, 120) as resp, open(dest, "wb") as f:
         while True:
             chunk = resp.read(1024 * 256)
             if not chunk:
                 break
             f.write(chunk)
+            digest.update(chunk)
     size = dest.stat().st_size
     if expected_size and size != expected_size:
         raise RuntimeError(f"下载不完整：{size} / {expected_size} 字节")
+    if expected_sha256 and not hmac.compare_digest(digest.hexdigest(), expected_sha256):
+        raise RuntimeError("下载的文件和签名清单对不上")
     with open(dest, "rb") as f:
         if f.read(2) != b"MZ":
             raise RuntimeError("下载的文件不是 Windows 可执行文件")
 
 
 _update_failed = {"tag": "", "times": 0, "retry_at": 0.0}      # 这次运行里哪个版本更新失败过、失败了几次、什么时候再试
+# 这次运行里已经在普通日志里说过的话（同一句只说一次，之后只记在详细日志里）；
+# pending：启动时问不到 GitHub、那时候还没连上机器人，等连上以后再从机器人问一次
+_update_said = {"github": False, "bot": "", "pending": False}
 
 
-def check_for_update(enabled: bool = True) -> bool:
-    """有新版本时下载并切换到新版本（返回 True 表示当前进程应立即退出）"""
+def check_for_update(enabled: bool = True, bot=None) -> bool:
+    """有新版本时下载并切换到新版本（返回 True 表示当前进程应立即退出）。
+    先问 GitHub；问不到（或者从 GitHub 下载不下来）又给了 bot，就改从机器人问、从机器人下载（带签名校验）"""
     if not enabled:
         return False
     if elevation_pending():
@@ -895,11 +969,32 @@ def check_for_update(enabled: bool = True) -> bool:
         # 两个都点「是」就是两个管理员身份的插件一起跑
         logger.debug("管理员权限的确认框还没人点，先不检查更新")
         return False
+    signed = None               # 从机器人拿到的签名清单；None = 这次走的是 GitHub
     try:
         latest = fetch_latest_release()
+        _update_said["pending"] = False
     except Exception as e:
-        logger.debug(f"检查更新失败: {e}")
-        return False
+        why = _why(e)
+        if bot is None:
+            _update_said["pending"] = True          # 启动时还没连机器人：连上以后再问（见 main）
+            logger.debug(f"问不到 GitHub 有没有新版本（{why}），等连上机器人再问")
+            return False
+        _update_said["pending"] = False
+        (logger.debug if _update_said["github"] else logger.info)(f"问不到 GitHub 有没有新版本（{why}），改问机器人")
+        _update_said["github"] = True
+        problem = ""
+        try:
+            signed = fetch_release_from_bot(bot)
+            if signed is None:
+                problem = "机器人那边还没有可以用的更新包"
+        except Exception as e2:
+            problem = "机器人还不支持" if isinstance(e2, HttpError) and e2.status == 404 else f"机器人那边也没问到（{_why(e2)}）"
+        if problem:
+            (logger.debug if _update_said["bot"] == problem else logger.info)(
+                f"{problem}。这台电脑暂时没法自动更新；想更新可以到 https://github.com/{UPDATE_REPO}/releases/latest 手动下载新版本换掉现在这个")
+            _update_said["bot"] = problem
+            return False
+        latest = ("v" + signed["version"], signed["url"], signed["size"])
     if not latest:
         return False
     tag, url, size = latest
@@ -927,12 +1022,29 @@ def check_for_update(enabled: bool = True) -> bool:
         info(f"有新版本 {tag}（当前 {VERSION}），源码运行不会自动替换，请到 GitHub 下载：{url}")
         return failed(quiet=True)
 
-    info(f"发现新版本 {tag}（当前 {VERSION}），正在下载更新...")
+    info(f"发现新版本 {tag}（当前 {VERSION}），正在{'从机器人' if signed else ''}下载更新...")
     exe = Path(sys.executable)
     new_file = exe.with_suffix(".new.exe")
     old_file = exe.with_suffix(".old.exe")
+
+    def get_exe() -> None:
+        """把新版本下到 new_file。GitHub 下载不下来又有机器人，就改从机器人下（要验签、核对 SHA-256）"""
+        if signed:
+            download_file(signed["url"], new_file, signed["size"], bot.headers, signed["sha256"])
+            return
+        try:
+            download_file(url, new_file, size)
+        except Exception as e:
+            if bot is None:
+                raise
+            info(f"从 GitHub 下载没成功（{_why(e)}），改从机器人下载")
+            alt = fetch_release_from_bot(bot)
+            if alt is None or parse_version(alt["version"]) < parse_version(tag):
+                raise RuntimeError(f"GitHub 下载失败（{_why(e)}），机器人那边也没有这一版") from None
+            download_file(alt["url"], new_file, alt["size"], bot.headers, alt["sha256"])
+
     try:
-        download_file(url, new_file, size)
+        get_exe()
         if old_file.exists():
             old_file.unlink()
         os.rename(exe, old_file)      # Windows 允许给正在运行的 exe 改名
@@ -1967,7 +2079,7 @@ class Companion:
                     # 要等到下次开游戏才更新——而那时候往往马上就排队、选人，又没空更新了
                     if self.update_due(now, ""):
                         self.next_update_check, self.update_after_game = now + UPDATE_CHECK_SECONDS, False
-                        if check_for_update(not self.args.no_update):
+                        if check_for_update(not self.args.no_update, self.bot):
                             return
                     time.sleep(10)
                     continue
@@ -2025,7 +2137,7 @@ class Companion:
 
             if self.update_due(now, phase):
                 self.next_update_check, self.update_after_game = now + UPDATE_CHECK_SECONDS, False
-                if check_for_update(not self.args.no_update):
+                if check_for_update(not self.args.no_update, self.bot):
                     return  # 已切换到新版本，本进程退出
 
             if now >= self.next_history_check:
@@ -6188,6 +6300,9 @@ def main() -> int:
         config["token"] = new_token
         save_config(config)
         bot.headers = {"Authorization": f"Bearer {new_token}"}
+    # 启动时问不到 GitHub 的：现在连上机器人了，从机器人再问一次有没有新版本
+    if _update_said["pending"] and check_for_update(not args.no_update, bot):
+        return 0
     import_file = args.import_blacklist or args.file
     if import_file:
         code = run_blacklist_import(Path(import_file), companion, bot)

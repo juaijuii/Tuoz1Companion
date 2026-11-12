@@ -65,11 +65,23 @@ jobs:
       - name: 自检本机认字能用
         run: dist\Tuoz1Companion.exe --ocr-selftest
 
+      # 给 exe 签名（见 tools/sign_release.py）：连不上 GitHub 的玩家会从机器人下载新版本，插件靠这个签名确认没被换过。
+      # 私钥是仓库的 Actions 密钥 RELEASE_SIGNING_KEY；没有密钥、或者和插件里的公钥对不上，这一步失败，不发版。
+      # 放在打包之后装 cryptography：它不该被打进 exe
+      - name: 给 exe 签名
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          python -m pip install cryptography
+          python tools/sign_release.py
+
       - name: 创建 Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
           name: ${{ env.TAG }}
           body_path: RELEASE_NOTES_${{ env.TAG }}.md
-          files: dist/Tuoz1Companion.exe
+          files: |
+            dist/Tuoz1Companion.exe
+            dist/Tuoz1Companion.exe.sig.json
           prerelease: ${{ contains(env.TAG, '-') }}
