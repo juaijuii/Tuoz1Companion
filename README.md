@@ -119,6 +119,11 @@ python tuoz1_companion.py -v               # 详细日志
 
 从 v1.2.0 起插件会自动更新：自动下载替换并重启，配置和令牌不受影响。不想自动更新加 `--no-update`。
 
+新版本平时从 GitHub 拿。有些电脑上插件连不上 GitHub（浏览器能上、插件不行），从 v1.12.0 起这种情况会改从机器人拿：
+机器人把 GitHub 上最新的 exe 和它的签名清单转过来，插件用内置的公钥验过签名、核对过文件内容才会换上。
+问不到 GitHub 的原因会写在窗口的日志里。如果日志里说「这台电脑暂时没法自动更新」，到
+[Releases](https://github.com/juaijuii/Tuoz1Companion/releases/latest) 手动下载新版本换掉旧的就行。
+
 什么时候检查新版本（v1.8.3 起）：启动时；每打完一局、战绩报完以后；闲着的时候每半小时一次。排到了等确认、选人、读条、对局中都不会更新，不会打断你。v1.8.2 及更早的版本是启动时和每 6 小时检查一次，想马上更新就关掉插件再打开。
 
 ## 工作原理
@@ -153,7 +158,11 @@ python tuoz1_companion.py -v               # 详细日志
 
 ## 自己打包
 
-直接运行 `build.bat`，产物在 `dist/Tuoz1Companion.exe`（约 43 MB，其中识别模型和运行库占了大半）。
+正式发版不在本机打包：推一个 `v*` 的 tag，GitHub 会自动打包、自检、签名（`tools/sign_release.py`，
+私钥是仓库的 Actions 密钥 `RELEASE_SIGNING_KEY`，作者电脑上有一份备份）并创建 Release。没有私钥的人打出来的包没有签名，
+只能自己用，不能通过机器人分发。
+
+想在本机打一个试试：直接运行 `build.bat`，产物在 `dist/Tuoz1Companion.exe`（约 43 MB，其中识别模型和运行库占了大半）。
 
 它会先在 `build/venv` 里建一个干净的环境，只装打包工具、`numpy` 和只用 CPU 的 `onnxruntime`，再打包。不要直接用系统 Python 打：系统里如果装的是带显卡加速的 `onnxruntime-gpu`，会把几百 MB 的显卡文件一起打进去。打完会自动跑一次 `--ocr-selftest`，确认模型和运行库都带上了。
 
