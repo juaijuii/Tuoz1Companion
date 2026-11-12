@@ -66,6 +66,8 @@ pip install numpy onnxruntime
 
 令牌和各种开关都存在 `companion_config.json` 里。从 v1.9.8 起它固定放在 `%APPDATA%\Tuoz1Companion\`（按 Win+R，输入 `%APPDATA%\Tuoz1Companion` 回车就能打开），不再和 exe 放在一起——所以把插件挪到别的文件夹不用重新输入令牌。从老版本更新上来的，第一次打开时会自动把 exe 旁边那份搬过去。
 
+如果平时用的是普通账号、申请管理员权限时输的是另一个管理员账号的密码：配置放在平时登录的那个账号的文件夹里（v1.9.9 起；v1.9.8 时已经存到管理员账号那边的，接着用那一份）。
+
 下文说「在 `companion_config.json` 里加一行」的，改的都是这个位置的文件；改完重开插件生效。日志 `companion.log` 还是在 exe 旁边。
 
 （直接用 Python 运行源码时，配置文件还是和 `tuoz1_companion.py` 放在一起。）
