@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import base64
 import difflib
+import gzip
 import http.client
 import json
 import logging
@@ -48,7 +49,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.9.9"
+VERSION = "1.10.0"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -476,8 +477,82 @@ HISTORY_TIMEOUT = 75
 HISTORY_KEEP_SECONDS = 600
 # 每人查最近多少局。耗时和局数成正比（实测 20 局约 5.6 秒、10 局约 3.3 秒、5 局约 2.1 秒），对面五个人要到读条才知道是谁，
 # 20 局的话五个人要将近半分钟、读条常常不够，所以用 10 局。十人战绩和开局情报必须用同一个数：
-# 客户端对同一个人只认第一次查的局数，之后再要更多局，给回来的还是第一次那些
+# 客户端对同一个人只认第一次查的局数，之后再要更多局，给回来的还是第一次那些。
+# 这是「让客户端代查」时的局数；直连战绩服务器时（v1.10.0，见下面）查 DIRECT_GAMES 局
 HISTORY_GAMES = 10
+
+# ----------------------------------------------------------------------------
+# 直连 Riot 的战绩服务器查别人的战绩
+# ----------------------------------------------------------------------------
+# 让客户端代查，其实是它替我们去问 Riot 的战绩服务器：一个一个来，读条时它自己还很忙。这里改成插件自己去问——
+# 用客户端里当前登录的通行证（只发给下面这几个 Riot 自己的服务器；不经过机器人，不写进日志和文件），
+# 一次请求就带回每一局全部十个人的数据，伤害占比不用再一局一局补查。
+# 做法参考 League Akari（MIT 协议，https://github.com/LeagueAkari/LeagueAkari），服务器对应表也来自它。
+# 这不是 Riot 公开的接口：地址可能变、可能限流，所以任何一步走不通都退回原来的查法（让客户端代查）。
+# 不想用：在 companion_config.json 里加一行 "direct_history": false
+_SGP_EU, _SGP_US = "https://euc1-red.pp.sgp.pvp.net", "https://usw2-red.pp.sgp.pvp.net"
+_SGP_NE, _SGP_SE = "https://apne1-red.pp.sgp.pvp.net", "https://apse1-red.pp.sgp.pvp.net"
+SGP_HOSTS = {                   # 客户端报的服务器（/riotclient/region-locale 的 region）-> 那个服的战绩服务器
+    "EUW": _SGP_EU, "EUW1": _SGP_EU, "RU": _SGP_EU, "TR": _SGP_EU, "TR1": _SGP_EU,
+    "EUNE": _SGP_EU, "EUN1": _SGP_EU, "ME1": _SGP_EU,         # 这一行 League Akari 的表里没有，是照同一个大区推的；不对的话查不到东西，自己会退回
+    "NA": _SGP_US, "NA1": _SGP_US, "BR": _SGP_US, "BR1": _SGP_US, "LAN": _SGP_US, "LA1": _SGP_US,
+    "LAS": _SGP_US, "LA2": _SGP_US, "PBE": _SGP_US, "PBE1": _SGP_US,
+    "KR": _SGP_NE, "JP": _SGP_NE, "JP1": _SGP_NE,
+    "OCE": _SGP_SE, "OC1": _SGP_SE, "TW2": _SGP_SE, "SG2": _SGP_SE, "PH2": _SGP_SE, "VN2": _SGP_SE, "TH2": _SGP_SE,
+}
+# 直连时每人查这么多局。实测（2026-11，大洋洲服）：十个人一起查，每人 20 局，全部回来 3.2 秒（每人 10 局 2.4 秒）；
+# 同一时间让客户端代查五个人、每人 10 局要 18.2 秒。同一个人两边给的数据一局一局对过，一样
+DIRECT_GAMES = 20
+SGP_TIMEOUT = 8                 # 一次请求最多等这么久（正常 1 秒上下）；超了就退回让客户端代查
+SGP_TOKEN_SECONDS = 300         # 通行证从客户端读出来以后用这么久再重读（它自己大约一小时过期；被拒了会马上重读一次）
+SGP_FAIL_LIMIT = 3              # 连着这么多次走不通，就先不走这条路了
+SGP_OFF_SECONDS = 600           # ……歇这么久再试
+_SGP_TOKEN_GUARD = threading.Lock()             # 几个人同时查时，通行证只读一次、大家共用
+_SGP_SLOTS = threading.Semaphore(4)             # 同时最多 4 个请求：别把人家的服务器问急了（League Akari 默认是 2 个）
+_sgp = {"enabled": True, "fails": 0, "off_until": 0.0, "error": ""}    # error：最近一次为什么没走通（测速时给人看）
+
+
+def sgp_game_to_lcu(game, puuid: str) -> dict | None:
+    """战绩服务器给的一局 -> 和客户端战绩接口一样的样子（后面算胜率、KDA、伤害占比的代码不用分两套）。
+    只留用得到的那几样。这一局里找不到要查的那个人就不要（返回 None）：宁可少一局，不能把别人的数据算到他头上"""
+    j = game.get("json") if isinstance(game, dict) else None
+    if not isinstance(j, dict) or not isinstance(j.get("gameId"), int):
+        return None
+    parts, idents, found = [], [], False
+    for n, x in enumerate(j.get("participants") or [], 1):
+        if not isinstance(x, dict):
+            continue
+        pid = x.get("participantId") if isinstance(x.get("participantId"), int) else n
+        parts.append({"participantId": pid, "teamId": x.get("teamId"), "championId": x.get("championId"),
+                      "stats": {"win": bool(x.get("win")), "kills": int(x.get("kills") or 0),
+                                "deaths": int(x.get("deaths") or 0), "assists": int(x.get("assists") or 0),
+                                "totalDamageDealtToChampions": int(x.get("totalDamageDealtToChampions") or 0)}})
+        idents.append({"participantId": pid, "player": {"puuid": x.get("puuid"), "gameName": x.get("riotIdGameName"),
+                                                         "tagLine": x.get("riotIdTagline")}})
+        found = found or x.get("puuid") == puuid
+    if not found:
+        return None
+    seconds = int(j.get("gameDuration") or 0)
+    if seconds > 50000 and not j.get("gameEndTimestamp"):       # 很老的对局这一项是毫秒
+        seconds //= 1000
+    return {"gameId": j["gameId"], "queueId": j.get("queueId"), "gameMode": j.get("gameMode"),
+            "gameCreation": j.get("gameCreation"), "gameDuration": seconds, "platformId": j.get("platformId"),
+            "participants": parts, "participantIdentities": idents}
+
+
+def _sgp_get(url: str, token: str, timeout: float):
+    """问战绩服务器。一局有一百多 KB、二十局就是两三 MB，所以要压缩过的（压完只剩十分之一）。
+    出错时只带状态码：回应的正文、请求头都不往外带，免得通行证进了日志"""
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token, "Accept": "application/json",
+                                               "Accept-Encoding": "gzip", "User-Agent": f"tuoz1-companion/{VERSION}"})
+    try:
+        with _open(req, timeout) as resp:
+            raw = resp.read()
+            if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
+                raw = gzip.decompress(raw)
+    except urllib.error.HTTPError as e:
+        raise HttpError(e.code, "") from None
+    return json.loads(raw.decode("utf-8", "ignore")) if raw else None
 
 
 class LCU:
@@ -534,7 +609,8 @@ class LCU:
         return (games[0] if games else None), platform
 
     def match_history(self, puuid: str, count: int = HISTORY_GAMES) -> list[dict]:
-        """任意玩家（puuid）最近 count 局。客户端里点开别人的战绩用的就是这个接口"""
+        """任意玩家（puuid）最近的对局，最新的在前。先直连战绩服务器（给 DIRECT_GAMES 局，每局带着全部十个人）；
+        走不通就让客户端代查（给 count 局，每局只有他自己）——客户端里点开别人的战绩用的就是这个接口"""
         # 开局情报和十人战绩都要查对面的人：刚查过的直接用，不让客户端重复去问
         # 而且同一个人同时只问一次（后到的等先到的结果），全插件同时最多 4 个请求：
         # 读条时客户端本来就忙，一口气问十几个人的战绩会把它卡到连「现在什么阶段」都答不上来
@@ -548,16 +624,87 @@ class LCU:
             hit = cache.get((puuid, count))
             if hit and time.time() - hit[0] < HISTORY_KEEP_SECONDS:
                 return hit[1]
-            with _HISTORY_SLOTS:
-                data = self.get(f"/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex={count - 1}",
-                                timeout=HISTORY_TIMEOUT) or {}
-            games = ((data.get("games") or {}).get("games")) or []
+            games = self.sgp_history(puuid, max(count, DIRECT_GAMES))       # 先直连战绩服务器（快）；走不通再让客户端代查
+            if games is None:
+                with _HISTORY_SLOTS:
+                    data = self.get(f"/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex={count - 1}",
+                                    timeout=HISTORY_TIMEOUT) or {}
+                games = ((data.get("games") or {}).get("games")) or []
             cache[(puuid, count)] = (time.time(), games)
         for key in [k for k, v in list(cache.items()) if time.time() - v[0] > HISTORY_KEEP_SECONDS + 300]:
             cache.pop(key, None)
         if len(_HISTORY_LOCKS) > 200:
             with _HISTORY_GUARD:
                 _HISTORY_LOCKS.clear()
+        return games
+
+    # --- 直连 Riot 的战绩服务器（见 SGP_HOSTS 上面的说明）---
+    def sgp_base(self) -> str:
+        """这个客户端登录的服对应的战绩服务器地址；不认识的服返回 ''"""
+        if os.environ.get("COMPANION_LCU_BASE"):                # 测试模式（客户端是假的，通行证也是假的）才能改地址
+            return (os.environ.get("COMPANION_SGP_BASE") or "").rstrip("/")
+        if "_sgp_base" not in self.__dict__:
+            region = str((self.get("/riotclient/region-locale", timeout=5) or {}).get("region") or "").upper()
+            if not region:
+                return ""                                       # 客户端还没准备好：下次再问
+            self._sgp_base = SGP_HOSTS.get(region, "")
+            if not self._sgp_base:
+                _sgp["error"] = f"不认识服务器 {region}"
+                logger.debug(f"直连查战绩：不认识服务器 {region}，让客户端代查")
+        return self._sgp_base
+
+    def sgp_token(self, rejected: str = "") -> str:
+        """客户端里当前登录的通行证。只在内存里放一会儿，不存盘、不进日志。
+        rejected：刚被战绩服务器拒掉的那一个——手里存的还是它就重读；别人已经重读过了就直接用新的"""
+        with _SGP_TOKEN_GUARD:
+            hit = self.__dict__.get("_sgp_token")
+            if hit and hit[1] and hit[1] != rejected and time.time() - hit[0] < SGP_TOKEN_SECONDS:
+                return hit[1]
+            token = str((self.get("/entitlements/v1/token", timeout=5) or {}).get("accessToken") or "")
+            self._sgp_token = (time.time(), token)
+            return token
+
+    def sgp_history(self, puuid: str, count: int, force: bool = False) -> list | None:
+        """直连战绩服务器查一个人最近 count 局，给回来的样子和客户端的战绩接口一样（最新的在前）。
+        返回 None = 这条路现在走不通，调用的人退回让客户端代查。force：不管开关和「先歇一会儿」（测速用）"""
+        if not force and (not _sgp["enabled"] or time.time() < _sgp["off_until"]):
+            return None
+        try:
+            base = self.sgp_base()
+            if not base:
+                return None
+            url = f"{base}/match-history-query/v1/products/lol/player/{urllib.parse.quote(puuid, safe='')}/SUMMARY?startIndex=0&count={int(count)}"
+            data, token = None, ""
+            for again in (False, True):
+                token = self.sgp_token(rejected=token)
+                if not token:
+                    _sgp["error"] = "客户端没给通行证"
+                    return None
+                try:
+                    with _SGP_SLOTS:
+                        data = _sgp_get(url, token, SGP_TIMEOUT)
+                    break
+                except HttpError as e:
+                    if e.status in (401, 403) and not again:
+                        continue                                # 通行证过期了：重读一次再问
+                    raise
+            games = [g for g in (sgp_game_to_lcu(x, puuid) for x in (data or {}).get("games") or []) if g]
+        except Exception as e:
+            reason = f"HTTP {e.status}" if isinstance(e, HttpError) else type(e).__name__
+            _sgp["error"] = reason
+            _sgp["fails"] += 1
+            limited = isinstance(e, HttpError) and e.status == 429                  # 被限流了：马上歇
+            if (limited or _sgp["fails"] >= SGP_FAIL_LIMIT) and not force:
+                _sgp["fails"], _sgp["off_until"] = 0, time.time() + SGP_OFF_SECONDS
+                logger.info(f"直连查战绩走不通（{reason}），接下来 {SGP_OFF_SECONDS // 60} 分钟让客户端代查（会慢一些）")
+            else:
+                logger.debug(f"直连查战绩：{puuid[:8]} 没查到（{reason}），让客户端代查")
+            return None
+        if not games:
+            _sgp["error"] = "一局都没给"
+            return None                 # 可能是真的没打过，也可能是问错了服务器：让客户端再查一次
+        _sgp["fails"] = 0
+        games.sort(key=lambda g: g.get("gameCreation") or 0, reverse=True)
         return games
 
     def game_details(self, game_id: int) -> dict:
@@ -1146,6 +1293,7 @@ def spawn_unelevated(cmd: list) -> bool:
 class Companion:
     def __init__(self, config: dict, bot: BotAPI, args):
         self.config = config
+        _sgp["enabled"] = config.get("direct_history") is not False        # 直连查战绩：只能在配置文件里关
         self.bot = bot
         self.args = args
         self.lcu: LCU | None = None
@@ -1379,7 +1527,7 @@ class Companion:
             logger.warning(f"通知机器人开局失败: {e}")
 
     def scout_enemies(self, game_id: int, start_payload: dict, players: list[dict]) -> None:
-        """开局情报：对面每个人最近 10 局（HISTORY_GAMES）的原始数据交给机器人，谁是大哥、谁开黑由机器人算（改算法不用发新版插件）。
+        """开局情报：对面每个人最近 20 局（直连查不了、让客户端代查时是 10 局）的原始数据交给机器人，谁是大哥、谁开黑由机器人算（改算法不用发新版插件）。
         只读客户端接口，不碰 Riot API；任何失败只记日志"""
         try:
             my_team = next((p["team"] for p in players if p.get("is_me")), None)
@@ -2983,8 +3131,8 @@ ARAM_OPTIONS = (("aram_auto", "海克斯选择推荐"),
                 ("aram_panel", "选人和读条时的攻略侧栏"),
                 ("aram_ai_guide", "AI 开局攻略"))
 # 全屏时自动改成无边框不放进细项：默认就开着，只能在配置文件里用 "aram_borderless": false 关
-ARAM_PLAYER_GAMES = HISTORY_GAMES   # 十人战绩：每人看最近这么多局（见 HISTORY_GAMES 的说明）
-ARAM_PREMADE_SHARED = 3         # 两个人最近的对局里有这么多局是同一局，就算一起开黑的
+ARAM_PLAYER_GAMES = DIRECT_GAMES    # 十人战绩：每人最多看最近这么多局（让客户端代查时只拿得到 HISTORY_GAMES 局）
+ARAM_PREMADE_SHARED = 3         # 两个人最近的对局里有这么多局是同一局、还在同一队，就算一起开黑的
 ARAM_BOSS_MIN_GAMES, ARAM_BOSS_MIN_WIN = 5, 0.55
 
 
@@ -3050,7 +3198,8 @@ def parse_champ_select(session: dict) -> dict:
 
 
 def summarize_player(games: list, puuid: str, skip_game_id=None) -> dict:
-    """一个人最近的对局 -> 局数、胜率、KDA、每分钟伤害，外加对局编号（用来看谁和谁一起打过）"""
+    """一个人最近的对局 -> 局数、胜率、KDA、每分钟伤害，外加（对局编号, 哪一队）（用来看谁和谁一起打过）。
+    带上哪一队：看的局数多了（20 局），人少的服里碰巧又排到同一局的也多了，但开黑的一定在同一队"""
     n = wins = kills = deaths = assists = damage = seconds = 0
     ids = set()
     for g in games or []:
@@ -3071,7 +3220,7 @@ def summarize_player(games: list, puuid: str, skip_game_id=None) -> dict:
         damage += int(st.get("totalDamageDealtToChampions") or 0)
         seconds += int(g.get("gameDuration") or 0)
         if g.get("gameId"):
-            ids.add(g["gameId"])
+            ids.add((g["gameId"], part.get("teamId")))
         if n >= ARAM_PLAYER_GAMES:
             break
     return {"games": n, "wins": wins, "win_rate": round(wins / n, 3) if n else None,
@@ -3125,7 +3274,7 @@ def collect_player_stats(lcu, teams: list, game_id=None, on_update=None) -> list
         stats = {"games": 0, "wins": 0, "win_rate": None, "kda": None, "dpm": None, "game_ids": set()}
         if p.get("puuid"):
             try:
-                stats = summarize_player(lcu.match_history(p["puuid"], ARAM_PLAYER_GAMES), p["puuid"], game_id)
+                stats = summarize_player(lcu.match_history(p["puuid"]), p["puuid"], game_id)
             except Exception as e:
                 logger.debug(f"十人战绩：查 {p['puuid'][:8]} 失败: {e}")
         row = {"team": p["team"], "slot": slot, "is_me": bool(p.get("is_me")), "champion_id": p.get("champion_id") or 0, **stats}
@@ -3139,6 +3288,85 @@ def collect_player_stats(lcu, teams: list, game_id=None, on_update=None) -> list
     with ThreadPoolExecutor(max_workers=5) as pool:
         list(pool.map(fetch, jobs))
     return player_stat_rows(done)
+
+
+def history_test() -> int:
+    """--history-test：量一下查别人的战绩有多快——直连 Riot 的战绩服务器，和让客户端代查，各用几秒；再对一下两边给的数据一不一样。
+    从自己最近几局里找别的玩家来查。日志里只有人数、局数和秒数，没有名字，也没有通行证。
+    客户端没开返回 2，找不到别的玩家返回 1"""
+    from concurrent.futures import ThreadPoolExecutor
+    found = find_lcu()
+    if not found:
+        logger.error("查战绩测速：没找到英雄联盟客户端，先把客户端开到大厅再试")
+        return 2
+    lcu = LCU(*found)
+    me = str(lcu.current_summoner().get("puuid") or "")
+    own = lcu.get("/lol-match-history/v1/products/lol/current-summoner/matches?begIndex=0&endIndex=9", timeout=HISTORY_TIMEOUT) or {}
+    people: list = []
+    for g in ((own.get("games") or {}).get("games")) or []:
+        try:
+            idents = (lcu.game_details(g.get("gameId")) or {}).get("participantIdentities") or []
+        except Exception as e:
+            logger.debug(f"查战绩测速：查对局详情失败: {type(e).__name__}")
+            continue
+        for i in idents:
+            puuid = str((i.get("player") or {}).get("puuid") or "")
+            if len(puuid) >= 30 and not puuid.startswith("00000000") and puuid != me and puuid not in people:
+                people.append(puuid)
+        if len(people) >= 26:
+            break
+    if len(people) < 2:
+        logger.error("查战绩测速：自己最近的对局里找不到别的玩家，没法测")
+        return 1
+    logger.info(f"查战绩测速：从自己最近的对局里找到 {len(people)} 个别的玩家")
+
+    def direct(puuid: str, count: int):
+        started = time.time()
+        games = lcu.sgp_history(puuid, count, force=True)
+        return time.time() - started, games
+
+    def proxied(puuid: str, count: int):
+        started = time.time()
+        try:
+            data = lcu.get(f"/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex={count - 1}",
+                           timeout=HISTORY_TIMEOUT) or {}
+            games = ((data.get("games") or {}).get("games")) or []
+        except Exception as e:
+            logger.debug(f"查战绩测速：客户端代查失败: {type(e).__name__}")
+            games = None
+        return time.time() - started, games
+
+    def together(ask, batch: list, count: int) -> str:
+        started = time.time()
+        with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+            got = list(pool.map(lambda p: ask(p, count), batch))
+        ok = sum(1 for _, games in got if games)
+        return f"{len(batch)} 个人一起查近 {count} 局：{ok} 个查到，全部回来用了 {time.time() - started:.1f} 秒"
+
+    # 1) 直连：先查一个人，看这条路通不通
+    seconds, games = direct(people[0], 20)
+    if games:
+        sizes = sorted({len(g["participants"]) for g in games})
+        logger.info(f"查战绩测速：直连，一个人近 20 局：{seconds:.1f} 秒，给回来 {len(games)} 局，每局带着 {sizes} 个人的数据")
+        logger.info("查战绩测速：直连，" + together(direct, people[1:11], 10))
+        logger.info("查战绩测速：直连，" + together(direct, people[1:11], 20))
+        # 2) 同一个人两边各查一次，对一下数据
+        _, theirs = proxied(people[0], 10)
+        mine = {g["gameId"]: summarize_player([g], people[0]) for g in games}
+        same = diff = 0
+        for g in theirs or []:
+            if g.get("gameId") in mine:
+                a, b = mine[g["gameId"]], summarize_player([g], people[0])
+                same, diff = (same + 1, diff) if all(a[k] == b[k] for k in ("wins", "kda", "dpm")) else (same, diff + 1)
+        logger.info(f"查战绩测速：同一个人两边都查到的对局里，{same} 局数据一样、{diff} 局不一样"
+                    f"（客户端给了 {len(theirs or [])} 局，其中 {len(theirs or []) - same - diff} 局直连那边没有）")
+    else:
+        logger.warning(f"查战绩测速：直连走不通（{_sgp['error'] or '不知道为什么'}），这台电脑上插件会一直让客户端代查")
+    # 3) 客户端代查：换一批这次没查过的人（客户端查过的人会记着，再查就很快，不准）
+    batch = people[11:16] if len(people) >= 16 else people[-5:]
+    logger.info("查战绩测速：客户端代查，" + together(proxied, batch, HISTORY_GAMES) + "（读条时查对面五个人就是这样）")
+    logger.info(f"查战绩测速：完成。结果也记在日志里：{LOG_PATH}")
+    return 0
 
 
 class AramAssistant:
@@ -3394,7 +3622,7 @@ class AramAssistant:
                 self.prefetched.add(puuid)
                 try:
                     started = time.time()
-                    lcu.match_history(puuid, ARAM_PLAYER_GAMES)
+                    lcu.match_history(puuid)
                     logger.debug(f"十人战绩：选人时先查好了一个队友（{time.time() - started:.1f} 秒）")
                 except Exception as e:
                     self.prefetched.discard(puuid)                # 没查成：下一轮再试
@@ -4490,7 +4718,7 @@ def player_badge(row: dict, game_mode: str = "") -> tuple[str, str, str, str, st
 
 
 class LoadingBadges:
-    """读条界面上的十人战绩：每张英雄卡片的底边贴一条小标签（近 10 局胜率 · KDA，开黑的标「双排 / 三排」，
+    """读条界面上的十人战绩：每张英雄卡片的底边贴一条小标签（近 20 局胜率 · KDA，开黑的标「双排 / 三排」，
     再按 KDA 评个「上等马 / 中等马 / 下等马 / 牛马」，一队里近期打得最凶的那个是「精品上等马」）。透明、鼠标点得穿、不抢焦点，和 AramOverlay 是同一种窗口。
     过程：有人的战绩查到了、游戏窗口也出来了 → 已经查到的那几条 150 毫秒淡入，之后查到一个贴一个 → 读条结束（游戏里开始走时间）→ 淡出。
     卡片从左到右的顺序用的是客户端的选英雄记录，上排是蓝色方、下排是红色方"""
@@ -5761,6 +5989,7 @@ def main() -> int:
     parser.add_argument("file", nargs="?", help=argparse.SUPPRESS)   # 把文件拖到 exe 上时，路径就在这里
     parser.add_argument("--no-gui", action="store_true", help="不开窗口，只用命令行")
     parser.add_argument("--ocr-selftest", action="store_true", help="检查本机认字能不能用（模型和运行库在不在），然后退出")
+    parser.add_argument("--history-test", action="store_true", help="量一下查别人的战绩有多快（直连和客户端代查各几秒；客户端要开着），结果写进日志，然后退出")
     parser.add_argument("--no-elevate", action="store_true", help="启动时不申请管理员权限（对局里按住 Tab 看出装可能没反应）")
     parser.add_argument("--elevated", action="store_true", help=argparse.SUPPRESS)    # 申请权限之后开出来的那个自己带着它
     parser.add_argument("--data-dir", help=argparse.SUPPRESS)       # 配置放哪：重新启动自己时带下去的（见 carry_args），文件开头就已经读过了
@@ -5771,6 +6000,8 @@ def main() -> int:
         return ocr_selftest()
 
     setup_logging(args.verbose)
+    if args.history_test:
+        return history_test()
     moved = migrate_config()
     logger.info(f"{APP_NAME} v{VERSION} — Tuoz1 Bot 客户端插件  (配置: {CONFIG_PATH})")
     if moved == "moved":
