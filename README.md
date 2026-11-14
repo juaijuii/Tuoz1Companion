@@ -41,6 +41,10 @@ pip install numpy onnxruntime
   里的 `locale` 改成 `zh_CN`（第一次改之前在同目录备份一份 `.tuoz1.bak`）。v1.9.7 起还会把 `zh_CN` 加进同一个文件里的
   `available_locales` 名单、把这个文件设成只读：不这样的话 Riot 客户端每次启动都把语言改回去，简体中文的语言包就得每次重新下载。
   第一次用 Riot 客户端会提示下载语音包，点更新就行。取消勾选会恢复成原来的语言、名单和可写状态。
+  有的电脑上只读拦不住 Riot 客户端，它每次启动照样把这个文件还原。所以 v1.12.1 起插件还盯着这个文件所在的文件夹，
+  一被改回去就马上改回来（不到 0.03 秒），赶在它开始换语言包之前；这种情况日志里会说一次「只读拦不住」。
+  如果每次重开 Riot 客户端还是要重新更新语言包，可以换一种不设只读的做法试试：在 `companion_config.json` 里加一行
+  `"zh_locale_mode": "watch"`（文件保持可写，只管被改回去时马上改回来，和 LOLauncher 是同一个思路），然后重开插件。
   客户端开着的时候改，要重开一次客户端才生效。
 - **自动接受对局**（v1.7.5）：找到对局弹出确认框时马上替你点「接受」（用客户端自己的接口，和手点一样）。已经自己点了拒绝的不动；默认关闭，勾上后记住。
 
@@ -155,6 +159,7 @@ python tuoz1_companion.py -v               # 详细日志
 - 认字用的是 PaddleOCR 的 PP-OCRv4 模型（Apache-2.0），模型文件在 `assets/ocr/`，用 onnxruntime 运行。
 - 头像墙换头像的做法参考了 [VeryVeryCoolName/league-profile-tool](https://github.com/VeryVeryCoolName/league-profile-tool)（MIT）。
 - 直连战绩服务器的做法参考了 [League Akari](https://github.com/LeagueAkari/LeagueAkari)（MIT）。
+- 简中汉化「语言一被改回去就马上改回来」的思路参考了 [ChenglongMa/LOLauncher](https://github.com/ChenglongMa/LOLauncher)（GPL-3.0；只参考了做法，代码是自己写的）。
 
 ## 自己打包
 

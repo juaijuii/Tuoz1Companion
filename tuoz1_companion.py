@@ -51,7 +51,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.12.0"
+VERSION = "1.12.1"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -2425,7 +2425,7 @@ def write_game_locale(locale: str, path: Path | None = None, pin: bool = False, 
     这个区服的名单里没有 zh_CN，不这样的话 Riot 客户端每次启动都把语言改回去、把语言包换回去，
     我们再改回来，下次启动它又得把简体中文的语言包重新下一遍（玩家手动汉化的老办法也是这两步）。
     pin=False：文件恢复成可写。unlist：顺便把这个语言从名单里拿掉（只拿我们自己加进去的）。
-    返回做了哪几样：{"locale", "listed", "readonly"}，什么都没动是空的"""
+    返回做了哪几样：{"locale", "listed", "readonly", "writable"}，什么都没动是空的"""
     path = path or lol_settings_path()
     raw = path.read_bytes().decode("utf-8")
     new, n = _LOCALE_RE.subn(lambda m: f'{m.group(1)}"{locale}"', raw, count=1)
@@ -2450,11 +2450,63 @@ def write_game_locale(locale: str, path: Path | None = None, pin: bool = False, 
         tmp.write_bytes(new.encode("utf-8"))
         os.replace(tmp, path)
     writable = bool(os.stat(path).st_mode & 0o200)
-    if writable == pin:              # 开着汉化要只读，关了要可写
+    if writable == pin:              # 固定时要只读，不固定时要可写
         os.chmod(path, 0o444 if pin else 0o666)
-        if pin:
-            did.add("readonly")
+        did.add("readonly" if pin else "writable")
     return did
+
+
+def locale_file_state(path: Path | None = None) -> dict:
+    """语言设置文件现在什么样：{"locale": 语言, "listed": 名单里有没有简体中文, "readonly": 是不是只读}。读不出来的那一项是 None"""
+    path = path or lol_settings_path()
+    state = {"locale": None, "listed": None, "readonly": None}
+    try:
+        raw = path.read_bytes().decode("utf-8")
+        m = _LOCALE_RE.search(raw)
+        state["locale"] = m.group(2) if m else None
+        names = listed_game_locales(raw)
+        state["listed"] = None if names is None else ZH_LOCALE in names
+        state["readonly"] = not bool(os.stat(path).st_mode & 0o200)
+    except Exception:
+        pass
+    return state
+
+
+class FolderWatch:
+    """等一个文件夹里有文件变动（Windows 的变更通知）：有变动 wait() 马上返回 True，不用一直去读文件。
+    这台电脑用不了（不是 Windows、文件夹不在）的话，wait() 就是普通地等那么久"""
+
+    def __init__(self, folder: Path):
+        self.handle = None
+        if not IS_WINDOWS:
+            return
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            k32.FindFirstChangeNotificationW.restype = ctypes.c_void_p
+            k32.FindFirstChangeNotificationW.argtypes = [ctypes.c_wchar_p, ctypes.c_int, ctypes.c_uint32]
+            k32.FindNextChangeNotification.argtypes = [ctypes.c_void_p]
+            k32.WaitForSingleObject.restype = ctypes.c_uint32
+            k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            # 文件名变了（删掉再改名换上去）、属性变了、大小变了、内容写过：这几样都算
+            handle = k32.FindFirstChangeNotificationW(str(folder), 0, 0x1 | 0x4 | 0x8 | 0x10)
+            if handle and handle != ctypes.c_void_p(-1).value:
+                self.handle, self._k32 = handle, k32
+        except Exception:
+            self.handle = None
+
+    def wait(self, seconds: float) -> bool:
+        if self.handle is None:
+            time.sleep(seconds)
+            return False
+        got = self._k32.WaitForSingleObject(self.handle, int(seconds * 1000))
+        if got == 0:
+            self._k32.FindNextChangeNotification(self.handle)      # 接着等下一次
+            return True
+        if got != 0x102:                 # 不是「等够了」：这个通知坏了，之后老老实实地等
+            self.handle = None
+            time.sleep(seconds)
+        return False
 
 
 def find_riot_client() -> Path | None:
@@ -2508,15 +2560,27 @@ def league_client_running() -> bool:
     return "leagueclientux.exe" in out.lower()
 
 
+LOCALE_FLIP_LIMIT = 12          # 监视方式：一分钟里被改回去这么多次，说明在和 Riot 客户端来回抢，先歇一分钟
+
+
 class LocaleKeeper:
-    """汉化开着的时候把语言设置固定成 zh_CN（见 write_game_locale 的 pin），并且每 3 秒看一眼：
-    Riot 客户端（更新 / 修复 / 改设置）要是还是改回去了，就再改成 zh_CN、重新固定住。
+    """汉化开着的时候让游戏语言保持 zh_CN。两种做法，配置文件里的 "zh_locale_mode" 选：
+    - 固定（默认，"pin"）：把 zh_CN 加进认可的语言名单、设置文件设成只读（见 write_game_locale 的 pin）。
+      Riot 客户端每次启动都想把语言改回去，文件只读它改不动。代价是它别的设置也存不进这个文件。
+    - 监视（"watch"）：文件不设只读，盯着它所在的文件夹，Riot 客户端一把语言改回去就马上改回来（几十毫秒）。
+      LOLauncher（https://github.com/ChenglongMa/LOLauncher）就是这个思路；有的电脑上「固定」不管用、每次开游戏都要更新，换这个试。
+    不管哪种，文件夹一有变动就马上看一眼，另外每 3 秒也看一眼。
     改的那一刻客户端开着的话，这次不生效、要重开客户端：窗口上一直提示，直到客户端关掉"""
 
     def __init__(self, config: dict):
         self.config = config
         self.changed_while_client_open = False
         self.last_error = ""
+        self._reported = False          # 这次运行里说过一次「设置文件现在什么样」没有
+        self._pinned = False            # 这次运行里已经固定住过一次：之后还被改，就是固定不管用
+        self._pin_broken = False
+        self._flips: list = []          # 监视方式：最近几次把语言改回来的时间
+        self._quiet_until = 0.0
         self._lock = threading.Lock()
         threading.Thread(target=self._loop, daemon=True, name="locale").start()
 
@@ -2545,18 +2609,30 @@ class LocaleKeeper:
                     logger.warning(self.last_error)
             save_config(self.config)
 
+    @property
+    def watching(self) -> bool:
+        """用的是不是「监视」那种做法（配置文件里 "zh_locale_mode": "watch"）"""
+        return self.config.get("zh_locale_mode") == "watch"
+
     def ensure(self) -> None:
-        if self.enabled:
+        if self.enabled and time.time() >= self._quiet_until:
             with self._lock:
                 self._apply()
 
     def _apply(self) -> None:
         try:
-            cur = read_game_locale()
+            before = locale_file_state()
+            cur = before["locale"]
             if cur is None:
                 self.last_error = "没找到英雄联盟的语言设置（游戏装了吗？）"
                 return
-            did = write_game_locale(ZH_LOCALE, pin=True)
+            watch = self.watching
+            if not self._reported:      # 每次运行说一次现在什么样：有人说汉化不对时，看这一行就知道是哪种情况
+                self._reported = True
+                yes_no = {True: "是", False: "否", None: "读不出来"}
+                logger.info(f"简中汉化：做法={'监视' if watch else '固定'}，游戏语言={cur}，"
+                            f"设置文件只读={yes_no[before['readonly']]}，认可的语言名单里有简体中文={yes_no[before['listed']]}")
+            did = write_game_locale(ZH_LOCALE, pin=not watch)
             if "listed" in did and not self.config.get("locale_listed"):
                 self.config["locale_listed"] = True          # 关掉汉化时把它从名单里拿掉
                 save_config(self.config)
@@ -2564,9 +2640,27 @@ class LocaleKeeper:
                 self.changed_while_client_open = league_client_running()
                 logger.info(f"游戏语言 {cur} → {ZH_LOCALE}（简体中文文字和语音）"
                             + ("，客户端开着，重开一次客户端后生效" if self.changed_while_client_open else ""))
-            if did - {"locale"}:
-                logger.info("简中汉化：已经把语言设置固定住（简体中文加进了游戏认可的语言名单，设置文件设成只读），"
-                            "Riot 客户端启动时不会再把语言改回去，简体中文的语言包也就不用每次重新下载了")
+            if watch:
+                if "writable" in did:
+                    logger.info("简中汉化（监视）：语言设置文件不再设成只读，Riot 客户端可以正常保存它自己的设置；"
+                                "语言被改回去的时候插件会马上改回来")
+                if "locale" in did:
+                    now = time.time()
+                    self._flips = [t for t in self._flips if now - t < 60] + [now]
+                    if len(self._flips) > LOCALE_FLIP_LIMIT:
+                        self._flips, self._quiet_until = [], now + 60
+                        logger.warning(f"简中汉化（监视）：一分钟里语言被改回去 {LOCALE_FLIP_LIMIT} 次以上，像是在和 Riot 客户端来回抢，先歇一分钟")
+            else:
+                # 已经固定住了还被改：这台电脑上只读拦不住 Riot 客户端（它每次启动都把这个文件整个还原）。只说一次。
+                # 这种电脑上靠的是下面 _loop 里的「文件一变马上改回来」：赶在 Riot 客户端开始换语言包之前
+                if self._pinned and not self._pin_broken and did & {"locale", "readonly"}:
+                    self._pin_broken = True
+                    logger.warning(f"简中汉化：语言设置文件已经设成只读，还是被 Riot 客户端改掉了（语言变成了 {cur}，只读{'被去掉了' if 'readonly' in did else '还在'}）。"
+                                   "这台电脑上只读拦不住它，插件已经马上改回来了；以后每次被改都会马上改回来")
+                elif did - {"locale"} and not self._pin_broken:
+                    logger.info("简中汉化：已经把语言设置固定住（简体中文加进了游戏认可的语言名单，设置文件设成只读），"
+                                "Riot 客户端启动时不会再把语言改回去，简体中文的语言包也就不用每次重新下载了")
+                self._pinned = True
             self.last_error = ""
         except Exception as e:
             msg = f"改语言失败：{e}"
@@ -2575,15 +2669,22 @@ class LocaleKeeper:
             self.last_error = msg
 
     def _loop(self) -> None:
+        watch = None                    # 盯着设置文件所在的文件夹：有变动马上看，不用干等 3 秒
         while True:
             try:
                 self.ensure()
                 # 客户端关掉了：下次打开读的就是新语言，「要重开」的提示可以撤了
                 if self.changed_while_client_open and not league_client_running():
                     self.changed_while_client_open = False
+                if watch is None and self.enabled and lol_settings_path().parent.is_dir():
+                    watch = FolderWatch(lol_settings_path().parent)
             except Exception:
                 pass
-            time.sleep(LOCALE_CHECK_SECONDS)
+            if watch is not None and self.enabled:
+                if watch.wait(LOCALE_CHECK_SECONDS):
+                    time.sleep(0.01)    # Riot 客户端换文件是「写新的、删旧的、改名」三步，稍等它做完再看（每一步都会再叫醒一次）
+            else:
+                time.sleep(LOCALE_CHECK_SECONDS)
 
     def status(self) -> str:
         if self.last_error:
