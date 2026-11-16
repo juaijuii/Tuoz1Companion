@@ -51,7 +51,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.12.1"
+VERSION = "1.12.2"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -3335,6 +3335,7 @@ ARAM_PICK_LEVELS = (1, 7, 11, 15, 21)
 ARAM_PICK_MAX = 5               # 一局最多能选几次：普通的四次 + 嘉宾带来的一次（21 级那次，或者 KDA 额外的那次）
 ARAM_FOUNTAIN_GRACE = 30        # 复活以后这么多秒内当作人还在泉水（这时升到对应等级，卡片也会出来）
 ARAM_LOADED_AT = 1.0            # 游戏里的时间走到这么多秒才算读条结束（自己加载完、等别人的时候时间停在 0）
+ARAM_LOAD_SILENT_MAX = 120      # 连续这么多秒问不到游戏里的时间：不等了，当作读条已经结束（不然战绩标签会整局挂在游戏画面上）
 ARAM_GUIDE_MIN_ENEMIES = 3      # 对面至少这么多人才写 AI 建议（和机器人那边的规矩一样）：一个人的自定义对局没有阵容可分析
 ARAM_INPUT_KEYS = (0x01, 0x02, 0x09, 0x20, 0x51, 0x57, 0x45, 0x52, 0x44, 0x46)   # 鼠标左右键、Tab、空格、Q W E R D F
 ARAM_INPUT_QUIET_SECONDS = 120  # 对局里游戏在最前面累计这么久、上面这些键一次都没看到：多半是系统不让插件看按键
@@ -3351,14 +3352,21 @@ ARAM_PREMADE_SHARED = 3         # 两个人最近的对局里有这么多局是�
 ARAM_BOSS_MIN_GAMES, ARAM_BOSS_MIN_WIN = 5, 0.55
 
 
-def live_clock(lcu) -> float | None:
-    """游戏里已经过了多少秒（游戏进程自己的接口，端口 2999）。读条时游戏还没开，问不到，返回 None"""
+def live_clock(lcu, note: dict | None = None) -> float | None:
+    """游戏里已经过了多少秒（游戏进程自己的接口，端口 2999）。读条时游戏还没开，问不到，返回 None。
+    note：问不到的时候把原因记在 note["why"] 里（给日志用）"""
     try:
         data = _http_json("GET", "https://127.0.0.1:2999/liveclientdata/gamestats", {}, timeout=1.5,
                           ssl_context=getattr(lcu, "ctx", None))
         seconds = (data or {}).get("gameTime")
-        return float(seconds) if isinstance(seconds, (int, float)) else None
-    except Exception:
+        if isinstance(seconds, (int, float)):
+            return float(seconds)
+        if note is not None:
+            note["why"] = "游戏有回应，但回应里没有时间"
+        return None
+    except Exception as e:
+        if note is not None:
+            note["why"] = _why(e)
         return None
 
 
@@ -4199,8 +4207,18 @@ class AramAssistant:
         if want_panel:
             threading.Thread(target=card, daemon=True, name="aram-card").start()
         loaded, answered, deadline = False, None, time.time() + 900
+        silent_since, note = time.time(), {}
         while self.prepared_game == game_id and time.time() < deadline:
-            seconds = live_clock(lcu)
+            seconds = live_clock(lcu, note)
+            if seconds is not None:
+                silent_since = time.time()
+            elif not loaded and time.time() - silent_since >= ARAM_LOAD_SILENT_MAX:
+                # 「读条结束」只有游戏里的时间这一个信号。这台电脑上一直问不到的话，以前标签会整局挂在游戏画面上；
+                # 现在等够了就当作读条已经结束，并把问不到的原因写下来
+                loaded = True
+                self.events.put(("loaded", game_id))
+                logger.warning(f"读条界面的战绩标签：已经连续 {ARAM_LOAD_SILENT_MAX} 秒问不到游戏里的时间"
+                               f"（原因：{note.get('why') or '不知道'}），没法知道读条结束了没有，先把标签收起来，免得一直挡着游戏画面")
             if seconds is not None and answered is None:
                 answered = time.time()                # 游戏的接口开始有回应了 = 我这台电脑加载完了（别人可能还没）
             # 游戏的接口有回应不等于读条结束：自己加载完了、还在等别人的时候它就有回应了，只是游戏里的时间还停在 0。
