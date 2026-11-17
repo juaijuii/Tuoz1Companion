@@ -51,7 +51,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.12.3"
+VERSION = "1.12.4"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -1076,6 +1076,7 @@ def check_for_update(enabled: bool = True, bot=None) -> bool:
         kwargs = {"cwd": str(exe.parent), "env": env, "close_fds": True}
         if IS_WINDOWS:
             kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+        release_instance()            # 「只开一个」的位置让给新版本，不然它一起来就以为已经有一个开着、自己退出了
         child = subprocess.Popen(args, **kwargs)
         time.sleep(3)
         if child.poll() is not None:
@@ -1087,6 +1088,7 @@ def check_for_update(enabled: bool = True, bot=None) -> bool:
             time.sleep(2)
     except Exception as e:
         logger.error(f"启动新版本失败，请手动双击 {exe.name}: {e}")
+        claim_instance()              # 新版本没起来，这个进程还要接着跑：位置占回来
         return failed(quiet=True)
     return True
 
@@ -1225,9 +1227,161 @@ def ensure_desktop_shortcut(config: dict, exe: Path | None = None, desktop: Path
 
 
 # ----------------------------------------------------------------------------
+# 同一台电脑只开一个插件
+# ----------------------------------------------------------------------------
+# 开了两个的话，每一局两个都会上报、补报队列也各跑各的，机器人那边同一个令牌一分钟只收 6 次上报，多出来的全被限流。
+# 做法：第一个插件占住一个有名字的「位置」（Windows 的命名互斥量，进程一退出系统自己收回，不会留下锁死的文件）；
+# 后来的发现位置被占了，就通知第一个「把窗口拿到前面来」，然后自己退出。
+# 名字前面的 Local\ = 只管当前登录的这个 Windows 用户：另一个用户切换登录进来，开他自己的插件不受影响。
+INSTANCE_MUTEX = "Local\\Tuoz1Companion.running"
+INSTANCE_EVENT = "Local\\Tuoz1Companion.show"
+INSTANCE_TAKEOVER_SECONDS = 15  # 管理员身份的自己接班时，最多等原来那个这么久（它开出我们以后马上就让出位置，正常一秒都用不了）
+_instance = {"mutex": None, "event": None}
+
+
+def _instance_api():
+    """这几个系统接口，参数和返回值的类型都写明（64 位上句柄不写明会被截断）"""
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.CreateMutexW.restype, k.CreateMutexW.argtypes = wintypes.HANDLE, [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    k.CreateEventW.restype = wintypes.HANDLE
+    k.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+    k.OpenEventW.restype, k.OpenEventW.argtypes = wintypes.HANDLE, [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    k.SetEvent.argtypes = [wintypes.HANDLE]
+    k.WaitForSingleObject.restype, k.WaitForSingleObject.argtypes = wintypes.DWORD, [wintypes.HANDLE, wintypes.DWORD]
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.LocalFree.argtypes = [ctypes.c_void_p]
+    return ctypes, wintypes, k
+
+
+def _instance_security(ctypes, wintypes):
+    """让普通权限的插件也碰得到管理员身份的插件建的这两样东西（默认是碰不到的）：谁都能用，低权限的也能。
+    它们只用来表示「已经开着了」和「把窗口拿到前面来」，放开没有风险。建不出来就用系统默认的（返回 None）"""
+    class SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("nLength", wintypes.DWORD), ("lpSecurityDescriptor", ctypes.c_void_p), ("bInheritHandle", wintypes.BOOL)]
+    try:
+        a = ctypes.WinDLL("advapi32", use_last_error=True)
+        a.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+        sd = ctypes.c_void_p()
+        if not a.ConvertStringSecurityDescriptorToSecurityDescriptorW("D:(A;;GA;;;WD)S:(ML;;NW;;;LW)", 1, ctypes.byref(sd), None):
+            return None, None
+        sa = SECURITY_ATTRIBUTES(ctypes.sizeof(SECURITY_ATTRIBUTES), sd, False)
+        return sa, sd
+    except Exception:
+        return None, None
+
+
+def claim_instance(wait: float = 0.0) -> bool:
+    """占住「这台电脑上只开一个」的位置。True = 占到了；False = 已经有一个插件开着。
+    wait：位置被占着时最多等这么多秒（接班的时候用：原来那个马上就走）。
+    不是 Windows、或者系统接口出了意料之外的错，一律当作占到了——宁可防不住多开，也不能让插件打不开"""
+    if not IS_WINDOWS or _instance["mutex"]:
+        return True
+    try:
+        ctypes, wintypes, k = _instance_api()
+        sa, sd = _instance_security(ctypes, wintypes)
+        deadline = time.time() + wait
+        try:
+            while True:
+                ctypes.set_last_error(0)
+                handle = k.CreateMutexW(ctypes.byref(sa) if sa is not None else None, False, INSTANCE_MUTEX)
+                err = ctypes.get_last_error()
+                if handle and err != 183:             # 183 = 这个名字已经有了
+                    _instance["mutex"] = handle
+                    return True
+                if handle:
+                    k.CloseHandle(handle)
+                elif err != 5:                        # 5 = 没权限碰：是权限比我们高的那个插件建的，也算已经有了
+                    logger.debug(f"查有没有别的插件开着时出错（{err}），当作没有")
+                    return True
+                if time.time() >= deadline:
+                    return False
+                time.sleep(0.25)
+        finally:
+            if sd:
+                k.LocalFree(sd)
+    except Exception as e:
+        logger.debug(f"查有没有别的插件开着时出错: {e}")
+        return True
+
+
+def release_instance() -> None:
+    """把位置让出来（马上要退出、换成另一个自己接着跑的时候）"""
+    handle, _instance["mutex"] = _instance["mutex"], None
+    if handle:
+        try:
+            _instance_api()[2].CloseHandle(handle)
+        except Exception:
+            pass
+
+
+def watch_wake() -> None:
+    """第一个插件：等后来的那个通知「又有人双击了一次」。收到了就在日志里说一声，并让窗口回到最前面（见 CompanionWindow._wake）"""
+    if not IS_WINDOWS or _instance["event"]:
+        return
+    try:
+        ctypes, wintypes, k = _instance_api()
+        sa, sd = _instance_security(ctypes, wintypes)
+        try:
+            event = k.CreateEventW(ctypes.byref(sa) if sa is not None else None, False, False, INSTANCE_EVENT)
+        finally:
+            if sd:
+                k.LocalFree(sd)
+        if not event:
+            return
+        _instance["event"] = event
+
+        def wait():
+            while True:
+                if k.WaitForSingleObject(event, 0xFFFFFFFF) != 0:
+                    return
+                UI_STATE["wake"] = time.time()
+                logger.info("刚才又打开了一次插件：已经开着了，不用再开一个（同一台电脑开两个，同一局战绩会报两遍）")
+        threading.Thread(target=wait, daemon=True, name="wake").start()
+    except Exception as e:
+        logger.debug(f"等「再开一次」的通知时出错: {e}")
+
+
+def wake_running_instance() -> bool:
+    """后来的那个：通知已经开着的插件把窗口拿到前面来。通知到了返回 True"""
+    if not IS_WINDOWS:
+        return False
+    try:
+        ctypes, wintypes, k = _instance_api()
+        event = k.OpenEventW(0x0002, False, INSTANCE_EVENT)       # EVENT_MODIFY_STATE
+        if not event:
+            return False
+        try:
+            # 系统只让「刚被用户点开的程序」把窗口拿到最前面——那是我们，不是已经开着的那个。这一句是把这个资格转给它
+            ctypes.WinDLL("user32").AllowSetForegroundWindow(0xFFFFFFFF)
+            return bool(k.SetEvent(event))
+        finally:
+            k.CloseHandle(event)
+    except Exception:
+        return False
+
+
+def already_running_notice() -> None:
+    """位置被占了：通知已经开着的那个把窗口拿到前面（提示显示在它的窗口里）。通知不到才弹系统的消息框"""
+    logger.info("插件已经开着了，这次不再启动（同一台电脑只开一个）")
+    if wake_running_instance() or not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            None, "小警察已经开着了，不用再开一个。\n\n窗口在任务栏里（金色六边形图标）。"
+                  "如果那个窗口点了没反应，在任务管理器里结束 Tuoz1Companion 再重新打开。",
+            "托子的小警察", 0x40 | 0x10000)                        # 信息图标 + 显示在最前面
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------------
 # 管理员权限：游戏通常是以管理员身份在跑，插件权限比它低的话系统不让插件看到按键（按住 Tab 看出装就没反应）
 # ----------------------------------------------------------------------------
-ELEVATE_LINGER_SECONDS = 6      # 申请到权限、开出管理员身份的自己以后，原来这个进程再留这么久才退出（比自动更新盯的 3 秒长）
+ELEVATE_LINGER_SECONDS = 6     # 申请到权限、开出管理员身份的自己以后，原来这个进程再留这么久才退出（比自动更新盯的 3 秒长）
 ELEVATE_WAIT_SECONDS = 20       # 确认框最多等这么久；还没人点（自动更新后弹的框常常只在任务栏里闪，人在打游戏根本没看见）就先照常运行
 _elevation = {"pending": False, "handover": None}
 # pending：主线已经不等确认框了，但确认框还挂着没人点。这期间不自动更新（见 check_for_update）
@@ -1306,6 +1460,7 @@ def ensure_elevated(args) -> bool:
             return                                    # 主线还在等：结果交给它处理
         if result == "started":
             logger.info("拿到管理员权限了，换成管理员身份的那个接着运行")
+            release_instance()                        # 「只开一个」的位置让给管理员身份的那个
             _hand_over()
             os._exit(0)                               # 这个进程已经在照常干活了：直接让位，免得两个插件一起报战绩
         logger.warning(denied)
@@ -1324,7 +1479,8 @@ def ensure_elevated(args) -> bool:
         return False
     if result == "started":
         # 别马上退出：旧版本自动更新完会盯新版本 3 秒，看到它退出了就以为没启动成功、会再开一个出来。
-        # 这几秒把自己的黑窗口藏起来（管理员身份的那个有它自己的窗口）
+        # 这几秒把自己的黑窗口藏起来（管理员身份的那个有它自己的窗口）；「只开一个」的位置现在就让给它
+        release_instance()
         show_console(False)
         time.sleep(max(0.0, ELEVATE_LINGER_SECONDS - (time.time() - born)))
         return True
@@ -4786,6 +4942,12 @@ UI_FONT = "Microsoft YaHei UI"
 LOG_LINES = 300
 
 
+def _mix(a: str, b: str, t: float) -> str:
+    """两个 #RRGGBB 颜色之间按比例取一个：t=0 是 a，t=1 是 b（Tk 的字没有透明度，渐变只能一帧一帧换颜色）"""
+    t = min(1.0, max(0.0, t))
+    return "#" + "".join(f"{round(int(a[i:i + 2], 16) + (int(b[i:i + 2], 16) - int(a[i:i + 2], 16)) * t):02X}" for i in (1, 3, 5))
+
+
 class _UiLogHandler(logging.Handler):
     def __init__(self, q):
         super().__init__(logging.INFO)
@@ -5992,6 +6154,8 @@ class CompanionWindow:
         self.launch_until = 0.0
         self.btn_mode = "launch"          # launch：没开客户端 / show：大厅开着，点了切过去 / ingame：对局中，点了没反应
         self.hint_override = ("", 0.0)
+        self.wake_seen = UI_STATE.get("wake", 0.0)     # 上一次处理的「又打开了一次插件」是哪一次
+        self.wake_at = 0.0                # 状态那一行正显示着「已经开着了」：从什么时候开始的；0 = 没在显示
         try:
             import ctypes
             ctypes.windll.shcore.SetProcessDpiAwareness(1)     # 高分屏上字不发虚
@@ -6367,20 +6531,89 @@ class CompanionWindow:
                 self.log.delete("1.0", f"{over + 1}.0")
             self.log.see("end")
             self.log.config(state="disabled")
+        if UI_STATE.get("wake", 0.0) != self.wake_seen:
+            self.wake_seen = UI_STATE.get("wake", 0.0)
+            try:
+                self._wake()
+            except Exception as e:
+                logger.debug(f"把窗口拿到前面时出错: {e}")
         self.root.after(200, self._tick_logs)
+
+    # --- 又打开了一次插件：窗口回到最前面，状态那一行说一声「已经开着了」 ---
+    # 过程：窗口还原、回到最前面（游戏在最前面时不抢，只让任务栏图标闪）→ 状态那行的字马上换成亮色的「已经开着了，不用再开一个」，
+    # 前面的圆点同时亮两下（每下 450 毫秒，亮起来快、暗下去慢）→ 一共停 3.2 秒 → 字用 0.8 秒从亮色暗回平时的灰色，
+    # 圆点回到平时的颜色，然后换回平时那句状态。全程只变颜色，版面不动。系统里关了动画的电脑上不闪不渐变，到点直接换回
+    WAKE_HOLD, WAKE_FADE, WAKE_PULSE = 3.2, 0.8, 0.45
+
+    def _wake(self):
+        import ctypes
+        u = ctypes.windll.user32
+        game = find_game_window()
+        hwnd = u.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+        if game and game == int(u.GetForegroundWindow() or 0):
+            u.FlashWindow(hwnd, True)                 # 正在游戏里：不抢，任务栏图标闪一下
+        else:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)    # 先顶到最上面再放开：只调 lift 的话常常被别的窗口压着
+            self.root.after(400, lambda: self.root.attributes("-topmost", False))
+            u.SetForegroundWindow(hwnd)
+            self.root.focus_force()
+        animated = ctypes.c_int(1)
+        try:
+            u.SystemParametersInfoW(0x1042, 0, ctypes.byref(animated), 0)      # 系统设置里「显示动画」开没开
+        except Exception:
+            pass
+        restart = not self.wake_at
+        self.wake_at = time.time()
+        self.wake_animated = bool(animated.value)
+        self.state_lbl.config(text="已经开着了，不用再开一个", fg=HEX["gold_hi"])
+        self.dot.config(fg=HEX["gold_hi"])
+        if restart:
+            self._wake_step()
+
+    def _wake_step(self):
+        t = time.time() - self.wake_at
+        if not self.wake_at or t >= self.WAKE_HOLD + self.WAKE_FADE:
+            self.wake_at = 0.0
+            self._show_status()
+            return
+        rest = HEX["bad"] if self._issue() else HEX["ok"]
+        if not self.wake_animated:
+            self.dot.config(fg=HEX["gold"])
+        elif t < self.WAKE_PULSE * 2:                 # 圆点亮两下：每下从亮色缓缓暗到金色
+            p = (t % self.WAKE_PULSE) / self.WAKE_PULSE
+            self.dot.config(fg=_mix(HEX["gold_hi"], HEX["gold"], 1 - (1 - p) ** 3))
+        elif t < self.WAKE_HOLD:
+            self.dot.config(fg=HEX["gold"])
+        else:                                         # 收尾：字暗回灰色，圆点回到平时的颜色
+            p = 1 - (1 - (t - self.WAKE_HOLD) / self.WAKE_FADE) ** 3
+            self.state_lbl.config(fg=_mix(HEX["gold_hi"], HEX["muted"], p))
+            self.dot.config(fg=_mix(HEX["gold"], rest, p))
+        self.root.after(30, self._wake_step)
+
+    def _issue(self) -> str:
+        c = self.companion
+        return getattr(c, "account_issue", "") if c.lcu is not None else ""
+
+    def _show_status(self):
+        """状态那一行平时的样子：连没连上客户端、当前登录的号"""
+        c = self.companion
+        if c.lcu is not None:
+            name = c.summoner.get("gameName") or c.summoner.get("displayName") or ""
+            self.state_lbl.config(text=f"已连上机器人 · 客户端 {name}".rstrip(), fg=HEX["muted"])
+        else:
+            self.state_lbl.config(text="已连上机器人 · 等待客户端", fg=HEX["muted"])
+        self.dot.config(fg=HEX["bad"] if self._issue() else HEX["ok"])
 
     def _tick_state(self):
         if not self.worker.is_alive():          # 主循环退出（比如自动更新换了新版本）：窗口跟着关
             self.root.destroy()
             return
         c = self.companion
-        issue = getattr(c, "account_issue", "") if c.lcu is not None else ""
-        if c.lcu is not None:
-            name = c.summoner.get("gameName") or c.summoner.get("displayName") or ""
-            self.state_lbl.config(text=f"已连上机器人 · 客户端 {name}".rstrip())
-        else:
-            self.state_lbl.config(text="已连上机器人 · 等待客户端")
-        self.dot.config(fg=HEX["bad"] if issue else HEX["ok"])
+        issue = self._issue()
+        if not self.wake_at:                    # 正显示着「已经开着了」的那几秒先不动这一行
+            self._show_status()
         if issue:
             self.issue_lbl.config(text=f"⚠ {issue}，怎么办看下面的日志")
             if not self.issue_shown:
@@ -6471,6 +6704,7 @@ def main() -> int:
     parser.add_argument("--history-test", action="store_true", help="量一下查别人的战绩有多快（直连和客户端代查各几秒；客户端要开着），结果写进日志，然后退出")
     parser.add_argument("--no-elevate", action="store_true", help="启动时不申请管理员权限（对局里按住 Tab 看出装可能没反应）")
     parser.add_argument("--elevated", action="store_true", help=argparse.SUPPRESS)    # 申请权限之后开出来的那个自己带着它
+    parser.add_argument("--allow-multi", action="store_true", help=argparse.SUPPRESS)  # 调试用：允许同时开好几个
     parser.add_argument("--data-dir", help=argparse.SUPPRESS)       # 配置放哪：重新启动自己时带下去的（见 carry_args），文件开头就已经读过了
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
@@ -6489,6 +6723,12 @@ def main() -> int:
         logger.info(f"配置文件搬到了 {CONFIG_PATH}：以后把插件挪到别的文件夹，不用再重新输入令牌")
     elif moved == "failed":
         logger.warning(f"配置文件没能搬到 {DATA_DIR}，这次还用 exe 旁边的那份")
+    # 同一台电脑只开一个。拖文件导入黑名单是用完就走的，不算；带 --elevated 的是来接班的（原来那个马上让位），等它一下
+    if not (args.import_blacklist or args.file or args.allow_multi):
+        if not claim_instance(INSTANCE_TAKEOVER_SECONDS if args.elevated else 0.0):
+            already_running_notice()
+            return 0
+        watch_wake()
     ensure_desktop_shortcut(load_config())
     if ensure_elevated(args):
         return 0
