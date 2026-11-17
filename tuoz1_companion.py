@@ -51,7 +51,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.12.2"
+VERSION = "1.12.3"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -3335,7 +3335,8 @@ ARAM_PICK_LEVELS = (1, 7, 11, 15, 21)
 ARAM_PICK_MAX = 5               # 一局最多能选几次：普通的四次 + 嘉宾带来的一次（21 级那次，或者 KDA 额外的那次）
 ARAM_FOUNTAIN_GRACE = 30        # 复活以后这么多秒内当作人还在泉水（这时升到对应等级，卡片也会出来）
 ARAM_LOADED_AT = 1.0            # 游戏里的时间走到这么多秒才算读条结束（自己加载完、等别人的时候时间停在 0）
-ARAM_LOAD_SILENT_MAX = 120      # 连续这么多秒问不到游戏里的时间：不等了，当作读条已经结束（不然战绩标签会整局挂在游戏画面上）
+ARAM_LOAD_SILENT_MAX = 120      # 连续这么多秒问不到游戏里的时间、游戏的日志也没用上：不等了，当作读条已经结束（不然战绩标签会整局挂在游戏画面上）
+ARAM_LOADED_CHECK = 5           # 「读条结束」的消息发出去这么多秒后，看一眼窗口那边处理了没有（没处理就在日志里说一声）
 ARAM_GUIDE_MIN_ENEMIES = 3      # 对面至少这么多人才写 AI 建议（和机器人那边的规矩一样）：一个人的自定义对局没有阵容可分析
 ARAM_INPUT_KEYS = (0x01, 0x02, 0x09, 0x20, 0x51, 0x57, 0x45, 0x52, 0x44, 0x46)   # 鼠标左右键、Tab、空格、Q W E R D F
 ARAM_INPUT_QUIET_SECONDS = 120  # 对局里游戏在最前面累计这么久、上面这些键一次都没看到：多半是系统不让插件看按键
@@ -3368,6 +3369,96 @@ def live_clock(lcu, note: dict | None = None) -> float | None:
         if note is not None:
             note["why"] = _why(e)
         return None
+
+
+# 游戏自己的日志里，所有人都加载完、游戏开始的那一刻先后写下这两行（实测三局，2026-11）：
+#   FLOW| Switching Game State from GAMESTATE_SPAWN to GAMESTATE_GAMELOOP for reason Received Game Start Packet.
+#   FLOW| Requesting State Transition: Popping LoadingScreen Current Topmost State: LoadingScreen
+# 自己加载完、还在等别人的时候写的是「Loading Ended」，不是这两行
+GAME_LOG_STARTED = (b"to GAMESTATE_GAMELOOP", b"Popping LoadingScreen")
+GAME_LOG_READ_MAX = 4 * 1024 * 1024     # 一次最多读这么多（读条阶段的日志只有十几 KB）
+_INSTALL_PATH_RE = re.compile(r'^product_install_full_path:\s*"?([^"\r\n]+?)"?\s*$', re.M)
+
+
+def game_install_dirs(lcu=None) -> list:
+    """英雄联盟可能装在哪几个文件夹，最可信的在前（不保证都存在）：
+    Riot 客户端自己记的安装位置 → 英雄联盟客户端报的 → 常见的几个位置"""
+    found = []
+
+    def add(text) -> None:
+        if isinstance(text, str) and text.strip():
+            path = Path(text.strip())
+            if path not in found:
+                found.append(path)
+    try:
+        meta = Path(os.environ.get("ProgramData") or r"C:\ProgramData") / "Riot Games" / "Metadata"
+        for file in sorted(meta.glob("league_of_legends.*/*.product_settings.yaml")):
+            m = _INSTALL_PATH_RE.search(file.read_text(encoding="utf-8", errors="ignore"))
+            if m:
+                add(m.group(1))
+    except Exception:
+        pass
+    try:
+        if lcu is not None:
+            add(lcu.get("/data-store/v1/install-dir", timeout=3))
+    except Exception:
+        pass
+    for drive in "CDEFG":
+        add(f"{drive}:\\Riot Games\\League of Legends")
+    return found
+
+
+class GameLog:
+    """这一局游戏自己写的日志（<安装目录>\\Logs\\GameLogs\\<开局时间>\\<开局时间>_r3dlog.txt）。
+    只读这一个本机文件：不联网，不碰游戏进程。用它知道读条结束了没有——以前只靠问游戏的接口（端口 2999），
+    有的电脑上那个接口问不到，战绩标签就一直挂在游戏画面上。
+    哪份日志是这一局的：日志开头有一行 GameStartData::GameID=对局编号，对得上才用"""
+
+    def __init__(self, lcu, game_id):
+        self.lcu, self.game_id = lcu, game_id
+        self.path = None                # 这一局的日志文件；None = 还没找到
+        self.why = "还没开始找"          # 没用上的原因（给日志用）
+        self.next_find = 0.0
+
+    def _find(self):
+        folders = [d / "Logs" / "GameLogs" for d in game_install_dirs(self.lcu)]
+        folders = [d for d in folders if d.is_dir()]
+        if not folders:
+            self.why = "没找到游戏放日志的文件夹"
+            return None
+        mark = re.compile(rb"GameStartData::GameID=%d(?!\d)" % int(self.game_id))
+        self.why = "游戏的日志里还没有这一局"
+        for folder in folders:
+            # 文件夹的名字就是开局时间（2026-11-12T18-35-25），按名字倒着排 = 最新的在前。掉线重进会多出一份，也是取新的
+            for name in sorted((p.name for p in folder.iterdir() if p.is_dir()), reverse=True)[:3]:
+                path = folder / name / f"{name}_r3dlog.txt"
+                try:
+                    with open(path, "rb") as f:
+                        head = f.read(256 * 1024)
+                except OSError as e:
+                    self.why = f"游戏的日志打不开（{_why(e)}）"
+                    continue
+                if mark.search(head):
+                    return path
+        return None
+
+    def started(self) -> bool | None:
+        """True = 日志里写了「所有人加载完，游戏开始」；False = 还没写；None = 这份日志现在用不上（原因在 self.why）"""
+        try:
+            if self.path is None:
+                if time.time() < self.next_find:
+                    return None
+                self.next_find = time.time() + 2      # 游戏进程起来才有这份日志，没找到就过两秒再找
+                self.path = self._find()
+                if self.path is None:
+                    return None
+            with open(self.path, "rb") as f:
+                text = f.read(GAME_LOG_READ_MAX)
+            self.why = ""
+            return any(mark in text for mark in GAME_LOG_STARTED)
+        except Exception as e:
+            self.why = f"游戏的日志读不了（{_why(e)}）"
+            return None
 
 
 def live_me(lcu) -> dict | None:
@@ -3741,6 +3832,8 @@ class AramAssistant:
         self._report_lock = threading.Lock()
         self.guide_off_until = 0.0
         self.started_game = None           # 哪一局已经确认开打了
+        self.overlay_alive = False         # 有没有窗口在收 events 里的消息（没有界面时没人收）
+        self.loaded_handled = None         # 窗口那边已经处理了哪一局的「读条结束」
         self.next_clock = 0.0
         self._tiers: dict = {}
         self._tiers_at = self._tiers_retry = 0.0
@@ -4208,26 +4301,48 @@ class AramAssistant:
             threading.Thread(target=card, daemon=True, name="aram-card").start()
         loaded, answered, deadline = False, None, time.time() + 900
         silent_since, note = time.time(), {}
+        game_log, log_said, loaded_at, checked = GameLog(lcu, game_id), False, 0.0, False
         while self.prepared_game == game_id and time.time() < deadline:
+            # 「读条结束」有两个互不相干的信号，谁先到算谁的：游戏的接口报的游戏内时间，和游戏自己写的日志。
+            # 问接口一次最长要等 1.5 秒，所以问之前、问之后各看一眼日志
+            if not loaded and not log_said:
+                log_said = bool(game_log.started())
             seconds = live_clock(lcu, note)
+            if not loaded and not log_said:
+                log_said = bool(game_log.started())
+            now = time.time()
             if seconds is not None:
-                silent_since = time.time()
-            elif not loaded and time.time() - silent_since >= ARAM_LOAD_SILENT_MAX:
-                # 「读条结束」只有游戏里的时间这一个信号。这台电脑上一直问不到的话，以前标签会整局挂在游戏画面上；
-                # 现在等够了就当作读条已经结束，并把问不到的原因写下来
-                loaded = True
-                self.events.put(("loaded", game_id))
-                logger.warning(f"读条界面的战绩标签：已经连续 {ARAM_LOAD_SILENT_MAX} 秒问不到游戏里的时间"
-                               f"（原因：{note.get('why') or '不知道'}），没法知道读条结束了没有，先把标签收起来，免得一直挡着游戏画面")
-            if seconds is not None and answered is None:
-                answered = time.time()                # 游戏的接口开始有回应了 = 我这台电脑加载完了（别人可能还没）
-            # 游戏的接口有回应不等于读条结束：自己加载完了、还在等别人的时候它就有回应了，只是游戏里的时间还停在 0。
-            # 以前一有回应就当读条结束，电脑快的人战绩标签闪一下就没了。要等游戏里的时间真的走起来才算
-            if seconds is not None and seconds >= ARAM_LOADED_AT and not loaded:
-                loaded = True
-                self.events.put(("loaded", game_id))
-                logger.info(f"读条结束，游戏开始了（游戏内时间 {seconds:.0f} 秒；自己加载完以后又等了别人 {time.time() - answered:.0f} 秒）")
-            if seconds is not None and seconds >= ARAM_PANEL_HIDE_AT:
+                silent_since = now
+                if answered is None:
+                    answered = now                    # 游戏的接口开始有回应了 = 我这台电脑加载完了（别人可能还没）
+            if not loaded:
+                # 游戏的接口有回应不等于读条结束：自己加载完了、还在等别人的时候它就有回应了，只是游戏里的时间还停在 0。
+                # 以前一有回应就当读条结束，电脑快的人战绩标签闪一下就没了。要等游戏里的时间真的走起来才算
+                if seconds is not None and seconds >= ARAM_LOADED_AT:
+                    loaded = True
+                    logger.info(f"读条结束，游戏开始了（游戏内时间 {seconds:.0f} 秒；自己加载完以后又等了别人 {now - answered:.0f} 秒）")
+                elif log_said:
+                    loaded = True
+                    logger.info("读条结束，游戏开始了（从游戏自己的日志里看到的"
+                                + ("" if seconds is not None else f"；游戏的接口这会儿问不到：{note.get('why') or '不知道原因'}") + "）")
+                elif seconds is None and now - silent_since >= ARAM_LOAD_SILENT_MAX:
+                    # 两个信号都没有：接口一直问不到，日志也没用上。等够了就当作读条已经结束，并把原因写下来
+                    loaded = True
+                    logger.warning(f"读条界面的战绩标签：已经连续 {ARAM_LOAD_SILENT_MAX} 秒问不到游戏里的时间"
+                                   f"（原因：{note.get('why') or '不知道'}），游戏自己的日志也没用上（{game_log.why or '里面还没写游戏开始'}），"
+                                   f"没法知道读条结束了没有，先把标签收起来，免得一直挡着游戏画面")
+                if loaded:
+                    loaded_at = now
+                    self.events.put(("loaded", game_id))
+            elif not checked and now - loaded_at >= ARAM_LOADED_CHECK:
+                # 消息发出去了，窗口那边收没收到？没收到的话标签还挂着，问题就不在「不知道读条结束」，而在窗口
+                checked = True
+                if self.overlay_alive and self.loaded_handled != game_id:
+                    logger.warning(f"读条结束的消息发出去 {ARAM_LOADED_CHECK} 秒了，插件的窗口还没处理（界面卡住了？），"
+                                   f"战绩标签可能还挂在游戏画面上")
+            # 游戏的接口问不到时，按「读条结束后过了多久」来算
+            if (seconds is not None and seconds >= ARAM_PANEL_HIDE_AT) or (
+                    seconds is None and loaded and now - loaded_at >= ARAM_PANEL_HIDE_AT):
                 self.started_game = game_id
                 self.events.put(("started", game_id))
                 return
@@ -4727,6 +4842,7 @@ class AramOverlay:
         w.SetWindowLongW(self.hwnd, -20, w.GetWindowLongW(self.hwnd, -20) | 0x80000 | 0x20 | 0x08000000 | 0x80)
         self._hide_window()
         self.bars = [self._make_bar() for _ in range(3)]
+        assistant.overlay_alive = True
         root.after(40, self._poll)
 
     def _hide_window(self) -> None:
@@ -4962,6 +5078,8 @@ class AramOverlay:
                             self.badges.set_pregame(ev[1])
                         elif ev[0] == "loaded":
                             self.badges.set_loaded(ev[1])
+                    if ev[0] == "loaded":
+                        self.assistant.loaded_handled = ev[1]      # 后台那条线过几秒会来看：窗口处理了没有
                     if self.panel is not None:
                         if ev[0] == "select":
                             self.panel.set_select(ev[1])
