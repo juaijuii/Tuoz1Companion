@@ -51,7 +51,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.12.4"
+VERSION = "1.13.0"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -2916,6 +2916,12 @@ ARAM_HOTKEYS = {f"F{n}": 0x6F + n for n in range(1, 13)}        # 配置文件�
 # （hextech-helper 的截图里标题中心在 40.0% 屏高，Riot 客户端 16.22 实测在 41.1%），
 # 所以不截固定的一窄条，而是截高一点的一条（37.2%–45.8%），在里面自己找标题那一行
 ARAM_CARD_CENTERS = (0.3115, 0.5, 0.6885)
+# 四张卡的中线（v1.13.0）。嘉宾是「音乐大师 烬」的局里每次都是四选一：卡片大小、间距、上下位置和三张时一样，
+# 只是多了一张，整组仍然左右居中。数是从一张裁过的视频截图上量的（拿底部那个蓝色按钮当尺子，和 1080p 的三选一对比），
+# 误差约 ±0.3% 画面宽，比 13.5% 宽的标题条小得多
+ARAM_CARD_CENTERS_4 = (0.214, 0.405, 0.595, 0.786)
+ARAM_CARD_COUNTS = (3, 4)                   # 卡片可能有几张；先试的排前面
+ARAM_COUNT_WORDS = {3: "三", 4: "四"}
 ARAM_BAND_TOP, ARAM_BAND_W, ARAM_BAND_H = 0.372, 0.135, 0.086
 ARAM_COOLDOWN = 0.7                         # 两次手动识别最少隔这么久（按住不放、连按）
 ARAM_SCAN_SECONDS = 0.35                    # 自动识别：对局中每隔这么久看一眼三张卡标题的位置
@@ -3052,11 +3058,17 @@ def game_layout() -> dict | None:
     return {"hwnd": hwnd, "client": (a.x, a.y, width, height), "content": (a.x + (width - cw) // 2, a.y, cw, height)}
 
 
-def aram_band_rect(layout: dict, slot: int) -> tuple[int, int, int, int]:
-    """第 slot 张卡（0–2）标题所在的那一条在屏幕上的位置 (左, 上, 宽, 高)。比标题本身高，里面还会有标题下面的小标签"""
+def aram_centers(count: int = 3) -> tuple:
+    """一共 count 张卡时，每张卡的中线 ÷ 画面宽"""
+    return ARAM_CARD_CENTERS_4 if count == 4 else ARAM_CARD_CENTERS
+
+
+def aram_band_rect(layout: dict, slot: int, count: int = 3) -> tuple[int, int, int, int]:
+    """一共 count 张卡时，第 slot 张（从 0 数）标题所在的那一条在屏幕上的位置 (左, 上, 宽, 高)。
+    比标题本身高，里面还会有标题下面的小标签"""
     left, top, cw, ch = layout["content"]
     width = max(8, int(cw * ARAM_BAND_W))
-    return (left + int(cw * ARAM_CARD_CENTERS[slot]) - width // 2, top + int(ch * ARAM_BAND_TOP),
+    return (left + int(cw * aram_centers(count)[slot]) - width // 2, top + int(ch * ARAM_BAND_TOP),
             width, max(8, int(ch * ARAM_BAND_H)))
 
 
@@ -3096,11 +3108,37 @@ def aram_find_title(bgra: bytes, width: int, height: int) -> tuple[int, int] | N
     return None
 
 
-def aram_title_shot(layout: dict, slot: int) -> tuple[tuple, bool, tuple]:
-    """截第 slot 张卡的标题：返回 ((像素, 宽, 高), 像不像卡片标题, 指纹)。
+def aram_title_shots(layout: dict, counts=(3,)) -> dict:
+    """把 counts 里每种排法（三张 / 四张）的标题都截下来：{张数: ([(像素, 宽, 高)], 每条的指纹, 有几条看着像卡片标题)}。
+    各种排法的标题条都在同一个高度上，所以只截一次（一整条横幅），再按位置切开：三张和四张都要看时也不多截"""
+    rects = {n: [aram_band_rect(layout, slot, n) for slot in range(n)] for n in counts}
+    every = [r for rs in rects.values() for r in rs]
+    left, right = min(r[0] for r in every), max(r[0] + r[2] for r in every)
+    top, height = every[0][1], every[0][3]
+    strip, stride = grab_screen(left, top, right - left, height), (right - left) * 4
+    out = {}
+    for n, rs in rects.items():
+        shots, bits, looks = [], [], 0
+        for x, _, width, _ in rs:
+            x0 = (x - left) * 4
+            raw = b"".join(strip[y * stride + x0:y * stride + x0 + width * 4] for y in range(height))
+            shot, ok, sig = aram_title_cut(raw, width, height)
+            shots.append(shot)
+            bits.append(sig)
+            looks += bool(ok)
+        out[n] = (shots, tuple(bits), looks)
+    return out
+
+
+def aram_title_shot(layout: dict, slot: int, count: int = 3) -> tuple[tuple, bool, tuple]:
+    """只截一张卡的标题：返回 ((像素, 宽, 高), 像不像卡片标题, 指纹)"""
+    left, top, width, height = aram_band_rect(layout, slot, count)
+    return aram_title_cut(grab_screen(left, top, width, height), width, height)
+
+
+def aram_title_cut(raw: bytes, width: int, height: int) -> tuple[tuple, bool, tuple]:
+    """一条截好的标题条：返回 ((像素, 宽, 高), 像不像卡片标题, 指纹)。
     找到标题行就只留那一行（上下各留一点边），发给机器人的也只是这一行；找不到就整条算作「不像」"""
-    left, top, width, height = aram_band_rect(layout, slot)
-    raw = grab_screen(left, top, width, height)
     found = aram_find_title(raw, width, height)
     if found is None:
         looks, sig = aram_fingerprint(raw, width, height)
@@ -3481,6 +3519,8 @@ ARAM_PEEK_VK = 0x09             # 收起以后按住这个键（Tab，也就是�
 # - 按等级：第一次开局就能选，之后升到 7、11、15 级各解锁一次；「世界赛」嘉宾把等级上限提到 21 级，21 级再多一次
 # - 不按等级：「KDA」嘉宾集满四张卡以后，下一次死亡后可以额外再选一个
 # - 一局只会有一个嘉宾，所以一局最多选五次
+# - 「音乐大师 烬」嘉宾（2026-11）：这一局每次都是四选一，不是三选一（卡片的位置见 ARAM_CARD_CENTERS_4）。
+#   它改不改「一局能选几次」还不知道，下面两个数先不动
 # - 卡片什么时候出来：解锁以后要等到死亡才出来；或者复活后人还在泉水时正好升到那一级，也会出来。
 #   所以会攒着，死一回连选两个（比如 7 级和 11 级的一起选）
 # 所以卡片只可能在这几种时候出现在屏幕上，插件只在这些时候才截图去找（见 AramAssistant._may_pick）：
@@ -3945,6 +3985,8 @@ class AramAssistant:
         self.next_scan = 0.0
         self.prev_bits = None              # 上一次扫到的指纹：和这次差不多才算「画面稳住了」
         self.shown_bits = None             # 正显示着的那组卡的指纹；None = 现在没在显示
+        self.shown_count = 3               # 正显示着的那组卡是几张
+        self.card_count = None             # 这一局每次出几张卡（3，或者嘉宾是「音乐大师 烬」时 4）；None = 这一局还没认出来过
         self.miss = 0                      # 显示着的时候连着几次不像卡片了
         self.neg_bits = None               # 发上去机器人说不是卡片的那个画面：一样的画面不再发
         self.neg_until = 0.0
@@ -4553,15 +4595,10 @@ class AramAssistant:
         return self.tables.get(champion_id)
 
     @staticmethod
-    def _shoot(layout: dict) -> tuple[list, tuple, int]:
-        """截三张卡的标题。返回 ([(像素, 宽, 高)], 三条的指纹, 有几条看着像卡片标题)"""
-        shots, bits, looks = [], [], 0
-        for slot in range(3):
-            shot, ok, sig = aram_title_shot(layout, slot)
-            shots.append(shot)
-            bits.append(sig)
-            looks += bool(ok)
-        return shots, tuple(bits), looks
+    def _shoot(layout: dict, counts=(3,)) -> dict:
+        """截卡片的标题，counts 里每种排法（三张 / 四张）各一份：
+        {张数: ([(像素, 宽, 高)], 每条的指纹, 有几条看着像卡片标题)}"""
+        return aram_title_shots(layout, counts)
 
     def _gone(self) -> None:
         if self.shown_bits is not None:
@@ -4578,6 +4615,7 @@ class AramAssistant:
             self.unlocked_seen, self.picks_done, self.cards_gone_at = 0, 0, None
             self.pick_names, self.dead, self.fountain_until = set(), None, 0.0
             self.slot_since, self.unlock_until = 0.0, 0.0
+            self.card_count = None                    # 嘉宾每局不一样：三张还是四张重新认
         if now < self.next_level or self.level_busy:
             return
         self.next_level, self.level_busy = now + 1.0, True
@@ -4650,30 +4688,40 @@ class AramAssistant:
         if self.shown_bits is None and not self._may_pick(now):
             self.prev_bits = None                 # 这会儿卡片不可能在屏幕上（人活着在外面，也没有刚解锁的）：不截图
             return
-        shots, bits, looks = self._shoot(layout)
-        stable = aram_same(bits, self.prev_bits)
-        self.prev_bits = bits
         if self.shown_bits is not None:
-            # 正显示着：只要还有两张像卡片就留着（鼠标悬停的那张会发光、变样）；连着两次都不像了才是选完了
-            if looks < 2:
+            # 正显示着：按显示着的那种排法盯着。只要还有「张数减一」张像卡片就留着（鼠标悬停的那张会发光、变样）；
+            # 连着两次都不像了才是选完了
+            n = self.shown_count
+            shots, bits, looks = self._shoot(layout, (n,))[n]
+            stable = aram_same(bits, self.prev_bits)
+            self.prev_bits = bits
+            if looks < n - 1:
                 self.miss += 1
                 if self.miss >= 2:
                     self._gone()
                 return
             self.miss = 0
             if stable and not aram_same(bits, self.shown_bits) and now >= self.next_upload and not self.busy:
-                self._start(layout, shots, bits, auto=True)       # 重掷换了卡：重认一次，认出来之前旧的标注先留着
+                self._start(layout, [(n, shots, bits)], auto=True)    # 重掷换了卡：重认一次，认出来之前旧的标注先留着
             return
+        # 还没显示。卡片是三张还是四张（嘉宾是「音乐大师 烬」的局每次都是四张）：这一局认出来过就只看那一种，
+        # 还没认出来过就两种位置都看——每张卡的标题条都像标题的那种才去认
+        counts = (self.card_count,) if self.card_count else ARAM_CARD_COUNTS
+        taken = self._shoot(layout, counts)
+        seen = tuple(sig for n in counts for sig in taken[n][1])
+        stable = aram_same(seen, self.prev_bits)
+        self.prev_bits = seen
         if not self.option("aram_auto"):
             return                                # 自动标注关了：只有按热键才认（认出来以后上面那段照样盯着卡片）
         local = self.local_index() is not None
+        full = [(n, taken[n][0], taken[n][1]) for n in counts if taken[n][2] >= n]
         # 交给机器人认的时候要等画面停稳了再发（一来一回不便宜）；本机认只要几十毫秒，卡片还在翻就可以先认着，
-        # 不过没停稳时要三张都认出来才显示（见 _recognize 的 strict）
-        if looks < 3 or (not stable and not local) or self.busy or now < self.next_upload or now < self.auto_off_until:
+        # 不过没停稳时要每一张都认出来才显示（见 _recognize 的 strict）
+        if not full or (not stable and not local) or self.busy or now < self.next_upload or now < self.auto_off_until:
             return
-        if self.neg_bits is not None and now < self.neg_until and aram_same(bits, self.neg_bits):
+        if self.neg_bits is not None and now < self.neg_until and aram_same(seen, self.neg_bits):
             return                                # 这个画面刚认过，不是卡片
-        self._start(layout, shots, bits, auto=True, strict=not stable)
+        self._start(layout, full, auto=True, strict=not stable, seen=seen)
 
     def press(self) -> None:
         """热键：马上认一次"""
@@ -4685,19 +4733,43 @@ class AramAssistant:
         if layout is None:
             logger.info(f"海克斯助手：按了 {self.hotkey_name}，但游戏窗口不在最前面，没法识别")
             return                            # 游戏不在最前面：截不到，也没地方显示
-        shots, bits, looks = self._shoot(layout)
-        logger.info(f"海克斯助手：按了 {self.hotkey_name}，三张卡里有 {looks} 张看着像标题，正在识别")
-        self._start(layout, shots, bits, auto=False)
+        # 手动的不管这一局认定过几张，三张和四张的位置都截：万一认定错了，按一下热键就能改过来。
+        # 先试标题条更像标题的那种；一样像时先试这一局认定过的，再不然先试三张
+        taken = self._shoot(layout, ARAM_CARD_COUNTS)
+        order = sorted(ARAM_CARD_COUNTS, key=lambda n: (-taken[n][2] / n, n != self.card_count, n))
+        logger.info(f"海克斯助手：按了 {self.hotkey_name}，" + "、".join(
+            f"按{ARAM_COUNT_WORDS[n]}张的位置看有 {taken[n][2]} 张像标题" for n in ARAM_CARD_COUNTS) + "，正在识别")
+        self._start(layout, [(n, taken[n][0], taken[n][1]) for n in order], auto=False)
 
-    def _start(self, layout: dict, shots: list, bits: tuple, auto: bool, strict: bool = False) -> None:
+    def _start(self, layout: dict, variants: list, auto: bool, strict: bool = False, seen=None) -> None:
         self.busy = True
         self.next_upload = time.time() + (ARAM_LOCAL_RECHECK if self.local_index() is not None else ARAM_RECHECK_SECONDS)
-        threading.Thread(target=self._recognize, args=(layout, shots, bits, auto, strict), daemon=True,
+        threading.Thread(target=self._recognize, args=(layout, variants, auto, strict, seen), daemon=True,
                          name="aram-recognize").start()
 
-    def _recognize(self, layout: dict, shots: list, bits: tuple, auto: bool, strict: bool = False) -> None:
-        """认三条标题：能在本机认就在本机认，否则发给机器人。auto=True 是自动扫到的：认不出来就悄悄算了，
-        不在游戏画面上弹提示。strict=True 是画面还没停稳时认的：三张都认出来才显示，免得翻到一半的卡标成「没认出来」"""
+    def _read_cards(self, info: dict, layout: dict, shots: list, index, auto: bool) -> tuple[list, bool]:
+        """认一组标题：能在本机认就在本机认，否则发给机器人。返回 (每张卡的结果, 是不是本机认的)"""
+        if index is not None:
+            try:
+                exact = index["exact"]
+                return aram_local_cards([LOCAL_OCR.read(raw, width, height, lambda text: aram_norm(text) in exact)
+                                         for raw, width, height in shots], index), True
+            except Exception as e:                    # 本机认出了岔子：这一次交给机器人
+                logger.debug(f"海克斯助手：本机认字出错（{e}），这次交给机器人")
+        images = [base64.b64encode(png_gray(raw, width, height)).decode() for raw, width, height in shots]
+        resp = self.bot.post_aram_augments({
+            "companion_version": VERSION, "game_id": info.get("game_id"), "champion_id": info["champion_id"],
+            "game_mode": info.get("game_mode"), "queue_id": info.get("queue_id"),
+            "screen": list(layout["client"][2:]), "auto": auto, "images": images})
+        return [c for c in resp.get("cards") or [] if isinstance(c, dict)], False
+
+    def _recognize(self, layout: dict, variants: list, auto: bool, strict: bool = False, seen=None) -> None:
+        """认卡片的标题。variants：[(张数, [(像素, 宽, 高)], 指纹)]，一般只有一种排法；还分不清是三张还是四张时
+        两种都在里面，先试排在前面的，对上的名字不够多再试后面的，取对上名字多的那种。
+        auto=True 是自动扫到的：认不出来就悄悄算了，不在游戏画面上弹提示。
+        strict=True 是画面还没停稳时认的：每一张都认出来才显示，免得翻到一半的卡标成「没认出来」。
+        seen：自动扫到时那一眼的全部指纹（认不出来时记下「这个画面不是卡片」用）"""
+        failed = 0                                    # 交给机器人认、被它退回来的那一次是几张
         try:
             info = self.game_info() or {}
             if not info.get("champion_id"):
@@ -4707,27 +4779,31 @@ class AramAssistant:
             if not auto:
                 self.events.put(("busy", layout))
             started = time.time()
-            index, local, cards = self.local_index(info["champion_id"]), False, []
-            if index is not None:
+            index, best, error = self.local_index(info["champion_id"]), None, None
+            for count, shots, bits in variants:
                 try:
-                    exact = index["exact"]
-                    cards = aram_local_cards([LOCAL_OCR.read(raw, width, height, lambda text: aram_norm(text) in exact)
-                                              for raw, width, height in shots], index)
-                    local = True
-                except Exception as e:                # 本机认出了岔子：这一次交给机器人
-                    logger.debug(f"海克斯助手：本机认字出错（{e}），这次交给机器人")
-            if not local:
-                images = [base64.b64encode(png_gray(raw, width, height)).decode() for raw, width, height in shots]
-                resp = self.bot.post_aram_augments({
-                    "companion_version": VERSION, "game_id": info.get("game_id"), "champion_id": info["champion_id"],
-                    "game_mode": info.get("game_mode"), "queue_id": info.get("queue_id"),
-                    "screen": list(layout["client"][2:]), "auto": auto, "images": images})
-                cards = [c for c in resp.get("cards") or [] if isinstance(c, dict)]
-            matched = sum(1 for c in cards if c.get("matched"))
-            where = "本机" if local else "机器人"
-            if matched >= (3 if auto and strict else 2 if auto else 1):
-                self.events.put(("cards", layout, cards))
-                self.shown_bits, self.miss = bits, 0
+                    got, by_local = self._read_cards(info, layout, shots, index, auto)
+                except Exception as e:
+                    if error is None:
+                        error, failed = e, count
+                    continue                          # 这种排法没认成（比如老版本的机器人不收四张）：接着试另一种
+                hit = sum(1 for c in got if c.get("matched"))
+                if best is None or hit > best[0]:
+                    best = (hit, count, got, bits, by_local)
+                if hit >= max(2, count - 1):
+                    break                             # 已经够明确了：不用再试另一种排法
+            if best is None:
+                raise error if error is not None else RuntimeError("没有可认的标题")
+            matched, count, cards, bits, local = best
+            where, word = "本机" if local else "机器人", ARAM_COUNT_WORDS.get(count, str(count))
+            if matched >= (count if auto and strict else 2 if auto else 1):
+                self.events.put(("cards", layout, cards, count))
+                self.shown_bits, self.shown_count, self.miss = bits, count, 0
+                if matched >= 2 and count != self.card_count:
+                    # 嘉宾一局不变：是「音乐大师 烬」就每次四张，不是就每次三张。认定以后这一局只看这一种位置
+                    if count == 4 or self.card_count:
+                        logger.info(f"海克斯助手：这一局每次是{word}张卡，标注按{word}张来摆")
+                    self.card_count = count
                 self._note_cards(cards)               # 还是同一次（重掷、收起又打开），还是已经换成下一次了
                 self.neg_bits, self.neg_streak = None, 0
                 names = tuple(aram_card_line(c) for c in cards)
@@ -4741,32 +4817,36 @@ class AramAssistant:
             elif auto:
                 logger.debug(f"海克斯助手：自动认了一次（{where}），没对上名字：" + " / ".join(str(c.get("text") or "") for c in cards))
                 # 本机觉得像、机器人认不出名字：多半不是海克斯三选一（或者卡片还在翻）。记下这个画面，越是连着白发越晚再发。
-                # 三张都读到了字、却一张都对不上的，是别的三选一（属性碎片）或商店：这个画面一分钟内不再问，别的画面也多等一会儿
+                # 都读到了字、却一张都对不上的，是别的三选一（属性碎片）或商店：这个画面一分钟内不再问，别的画面也多等一会儿
                 wrong = matched == 0 and sum(1 for c in cards if c.get("text")) >= 2
+                seen = bits if seen is None else seen     # 记的是扫描时那一眼的全部指纹（两种排法都看时是七条）
                 if local:
                     # 本机认的不花网络：只记住「这个画面不是」，别的画面马上可以再认（卡片翻到一半时就是这样，下一眼就认出来了）
-                    self.neg_bits, self.neg_until = bits, time.time() + (60 if wrong else 3)
+                    self.neg_bits, self.neg_until = seen, time.time() + (60 if wrong else 3)
                     self.next_upload = time.time() + ARAM_LOCAL_RECHECK
                 else:
-                    self.neg_bits, self.neg_until = bits, time.time() + (60 if wrong else 30)
+                    self.neg_bits, self.neg_until = seen, time.time() + (60 if wrong else 30)
                     self.neg_streak += 2 if wrong else 1
                     self.next_upload = time.time() + min(15.0, ARAM_RECHECK_SECONDS * 2 ** min(self.neg_streak, 4))
             elif matched == 0 and sum(1 for c in cards if c.get("text")) >= 2:
-                logger.info("海克斯助手：这三张不是海克斯（读到的是 " + " / ".join(str(c.get("text") or "") for c in cards) + "）")
-                self.events.put(("msg", layout, "这三张不是海克斯，没有推荐"))
+                logger.info(f"海克斯助手：这{word}张不是海克斯（读到的是 " + " / ".join(str(c.get("text") or "") for c in cards) + "）")
+                self.events.put(("msg", layout, f"这{word}张不是海克斯，没有推荐"))
             elif any(c.get("text") for c in cards):
                 logger.info("海克斯助手：读到了字但对不上海克斯的名字：" + " / ".join(str(c.get("text") or "") for c in cards))
-                self.events.put(("cards", layout, cards))     # 读到字了但对不上：把读到的显示出来
-                self.shown_bits, self.miss = bits, 0
+                self.events.put(("cards", layout, cards, count))      # 读到字了但对不上：把读到的显示出来
+                self.shown_bits, self.shown_count, self.miss = bits, count, 0
             else:
-                logger.info("海克斯助手：机器人没在截图里读到字")
+                logger.info("海克斯助手：没在截图里读到字")
                 self.events.put(("msg", layout, "没看到海克斯卡片，等卡片翻开再按一次"))
         except HttpError as e:
             text = {401: "令牌失效了，看插件窗口的提示", 404: "机器人还不支持海克斯助手",
                     429: "识别得太频繁了，等几秒", 503: "机器人暂时认不了，稍后再试"}.get(e.status, f"机器人出错（{e.status}）")
+            old_bot = e.status == 400 and failed == 4     # 2026-11-20.4 之前的机器人最多收三张图，四张会退回来
+            if old_bot:
+                text = "机器人还认不了四张卡的，要等它更新"
             if auto:
                 # 自动的不往游戏画面上弹错误；这类错误短时间内再试也一样，歇一会儿（期间按热键仍然可以手动试）
-                pause = 600 if e.status in (401, 404) else 20
+                pause = 600 if e.status in (401, 404) or old_bot else 20
                 if time.time() >= self.auto_off_until:
                     logger.info(f"海克斯助手：{text}，自动识别先停 {pause} 秒")
                 self.auto_off_until = time.time() + pause
@@ -5003,7 +5083,8 @@ class AramOverlay:
         # 分层 | 鼠标穿透 | 不抢焦点 | 不进任务栏
         w.SetWindowLongW(self.hwnd, -20, w.GetWindowLongW(self.hwnd, -20) | 0x80000 | 0x20 | 0x08000000 | 0x80)
         self._hide_window()
-        self.bars = [self._make_bar() for _ in range(3)]
+        self.bars = [self._make_bar() for _ in range(max(ARAM_CARD_COUNTS))]
+        self.cards_count = 3            # 现在显示着的那组卡是几张
         assistant.overlay_alive = True
         root.after(40, self._poll)
 
@@ -5025,11 +5106,12 @@ class AramOverlay:
                 "dots": dots, "x": 0, "y": 0, "extra": 0}
 
     # --- 摆放 ---
-    def _geometry(self, layout: dict, slot: int) -> tuple[int, int, int, int]:
-        """第 slot 条标注在悬浮层里的位置：横向对准卡片中线，贴在卡片上沿的上方"""
+    def _geometry(self, layout: dict, slot: int, count: int = 3) -> tuple[int, int, int, int]:
+        """一共 count 张卡时，第 slot 条标注在悬浮层里的位置：横向对准卡片中线，贴在卡片上沿的上方。
+        四张时相邻两张卡的中线隔 19% 画面宽，条宽 15.5%，不会互相压住"""
         left, top, cw, ch = layout["content"]
         width, height = int(cw * 0.155), max(22, int(ch * 0.043))
-        cx = left + cw * ARAM_CARD_CENTERS[slot]
+        cx = left + cw * aram_centers(count)[slot]
         return int(cx - width / 2) - layout["client"][0], int(top + ch * 0.118) - layout["client"][1], width, height
 
     def _show_window(self, layout: dict) -> bool:
@@ -5136,21 +5218,24 @@ class AramOverlay:
         self.dot_step += 1
         self._later(220, self._tick_dots)
 
-    def show_cards(self, layout: dict, cards: list) -> None:
+    def show_cards(self, layout: dict, cards: list, count: int = 3) -> None:
+        """count：这一组是几张卡（3，或者四选一时 4）。标注条按这个张数对准每张卡"""
+        count = count if count in ARAM_CARD_COUNTS else 3
         # 已经显示着一组卡（重掷后重认、鼠标悬停引起的重认）：原地换字，不再重放落下的动画，免得一闪一闪
-        animate = not (self.cards_on and self.layout == layout)
+        animate = not (self.cards_on and self.layout == layout and self.cards_count == count)
         self.clear(keep_window=True)
         if not self._show_window(layout):
             return
+        self.cards_count = count
         by_slot = {c.get("slot"): c for c in cards if isinstance(c.get("slot"), int)}
         best = None
-        for slot in range(3):
+        for slot in range(count):
             card = by_slot.get(slot)
             if card is None:
                 continue
             bar = self.bars[slot]
             is_best = bool(card.get("best") and card.get("matched"))
-            bx, by, bw, bh = self._geometry(layout, slot)
+            bx, by, bw, bh = self._geometry(layout, slot, count)
             self._fill(bar, layout, card, bright=is_best and not animate)   # 有动画时先都按普通样子落下来，推荐的最后再亮
             by, bh = by - bar["extra"], bh + bar["extra"]                    # 行数多的条往上长，下沿不动
             if animate:
@@ -5161,7 +5246,8 @@ class AramOverlay:
             else:
                 bar["edge"].place(x=bx, y=by, width=bw, height=bh)
         if best:
-            self._later(2 * 60 + (len(ARAM_DROP) - 1) * 30 + 80, lambda: self._fill(best[0], layout, best[1], bright=True))
+            # 最后一条落到位以后再亮（三张时是 240 毫秒，四张时多一条、多 60 毫秒）
+            self._later((count - 1) * 60 + (len(ARAM_DROP) - 1) * 30 + 80, lambda: self._fill(best[0], layout, best[1], bright=True))
         self.cards_on = True
         if self.panel is not None:
             self.panel.set_picking(True)              # 侧栏换到海克斯那一页
@@ -5261,7 +5347,7 @@ class AramOverlay:
                 elif ev[0] == "busy":
                     self.show_busy(ev[1])
                 elif ev[0] == "cards":
-                    self.show_cards(ev[1], ev[2])
+                    self.show_cards(ev[1], ev[2], ev[3] if len(ev) > 3 else 3)
                 elif ev[0] == "msg":
                     self.show_message(ev[1], ev[2])
         except Exception as e:
