@@ -51,7 +51,7 @@ import urllib.request
 from pathlib import Path
 
 APP_NAME = "Tuoz1 Companion"
-VERSION = "1.13.0"
+VERSION = "1.13.1"
 PROTOCOL_VERSION = 1
 SERVER_URL = "http://api.tuoz1bot.com:5016"   # 机器人地址写死；--server 只能临时覆盖，不会写进配置
 
@@ -437,14 +437,103 @@ class _QuickHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(_QuickHTTPSConnection, req, context=self._quick_context)
 
 
-def _open(req, timeout: float):
-    """连外面的服务器（机器人、GitHub）都走这里；连本机的客户端 / 游戏用不着（只有一个地址）"""
+DIRECT_FIRST_HOSTS = {urllib.parse.urlsplit(SERVER_URL).hostname or ""}     # 这些域名先直连（机器人）；BotAPI 会把它实际连的那个也加进来
+ROUTE_KEEP_SECONDS = 600        # 「这个域名走哪条路通」记这么久，期间先走这条；过了再按平时的先后来
+_PROXY_OPENERS: dict = {}       # 代理设置 -> 走这套代理的 opener（代理中途开了 / 关了 / 换了，就按新的来）
+_ROUTE: dict = {}               # 域名 -> (走通的那条路 "direct" / "proxy", 记到什么时候)
+_ROUTE_NOTED: set = set()       # 换路走通了，在日志里说过的域名（每个只说一次）
+_LOCAL_OPENERS: dict = {}       # 连本机客户端 / 游戏用的 opener（不走代理），按证书设置存着
+
+
+def _system_proxies() -> dict:
+    """电脑上设的代理（翻墙软件、开了「系统代理」的加速器写进系统设置的，或者 HTTP_PROXY 这类环境变量）"""
+    try:
+        return {k: v for k, v in urllib.request.getproxies().items() if k in ("http", "https") and v}
+    except Exception:
+        return {}
+
+
+def _opener_for(proxies: dict):
+    """走这套代理的 opener；proxies 是空的 = 直连"""
     global _OPENER
-    if _OPENER is None:
+    if not proxies and _OPENER is not None:
+        return _OPENER
+    key = tuple(sorted(proxies.items()))
+    opener = _PROXY_OPENERS.get(key) if proxies else None
+    if opener is None:
         https = _QuickHTTPSHandler()
         https._quick_context = ssl.create_default_context()
-        _OPENER = urllib.request.build_opener(_QuickHTTPHandler(), https)
-    return _OPENER.open(req, timeout=timeout)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), _QuickHTTPHandler(), https)
+        if proxies:
+            if len(_PROXY_OPENERS) > 4:
+                _PROXY_OPENERS.clear()
+            _PROXY_OPENERS[key] = opener
+        else:
+            _OPENER = opener
+    return opener
+
+
+def _open(req, timeout: float):
+    """连外面的服务器（机器人、GitHub、Riot 的战绩服务器）都走这里；连本机的客户端 / 游戏走 _open_local。
+
+    电脑上设了系统代理时走哪条路（v1.13.1）。以前没管这件事，Python 自己会去读系统里设的代理，所有请求都交给它：
+    代理的线路不通机器人那个端口（5016，不是常见的 80 / 443）时，它回一个空的 502，插件就报「连接机器人失败: HTTP 502」，
+    而机器人其实好好的（国服插件 2026-11-21 有人碰到，那边 v2.7.1 改了，这里是同一件事）。
+    - 机器人：先直连，连不上再走代理（有的公司 / 学校网络只能经代理上网）。
+    - 别的（GitHub、Riot）：和以前一样先走代理——在国内不挂代理时 GitHub 常常不是连不上而是慢、下到一半卡住，
+      先直连反而坏事；代理走不通再直连。
+    - 没设代理的电脑：和以前完全一样，直连一次。
+    什么时候换另一条路：这条路还没把请求发出去就失败了（连不上）；或者走的是代理、代理替对面回了 502 / 503 / 504，
+    而且这个请求只是「问」（GET）——上报这类「送」的请求不重发，免得对面收到两遍。
+    对面自己回的错（401、404……）、等回应等到一半断掉的，都不换路、不重发。
+    两条路都不通时报第一条路的错。换路走通了，这个域名记 ROUTE_KEEP_SECONDS 秒，期间先走通的那条"""
+    proxies = _system_proxies()
+    if not proxies:
+        return _opener_for({}).open(req, timeout=timeout)
+    host = urllib.parse.urlsplit(req.full_url).hostname or ""
+    order = ["direct", "proxy"] if host in DIRECT_FIRST_HOSTS else ["proxy", "direct"]
+    kept = _ROUTE.get(host)
+    if kept and time.time() < kept[1] and kept[0] != order[0]:
+        order.reverse()
+
+    def go(route: str):
+        # 每次都另抄一份请求：走代理时 Python 会把请求里的地址改成代理的，原样再拿去直连就连到代理上去了
+        copy = urllib.request.Request(req.full_url, data=req.data, headers=dict(req.headers), method=req.get_method())
+        return _opener_for(proxies if route == "proxy" else {}).open(copy, timeout=timeout)
+    try:
+        return go(order[0])
+    except urllib.error.HTTPError as e:
+        if not (order[0] == "proxy" and e.code in (502, 503, 504) and req.get_method() in ("GET", "HEAD")):
+            if kept and e.code in (502, 503, 504):
+                _ROUTE.pop(host, None)                # 记着的那条路不灵了：下次按平时的先后来
+            raise
+        first = e
+    except urllib.error.URLError as e:                # 连不上 / 请求没发出去。等回应时断掉的不在这里（那种不重发）
+        first = e
+    _ROUTE.pop(host, None)
+    try:
+        resp = go(order[1])
+    except Exception:
+        raise first from None                         # 另一条路也不行：报第一条路的错
+    _ROUTE[host] = (order[1], time.time() + ROUTE_KEEP_SECONDS)
+    if host not in _ROUTE_NOTED:
+        _ROUTE_NOTED.add(host)
+        why = f"HTTP {first.code}" if isinstance(first, urllib.error.HTTPError) else str(getattr(first, "reason", first))[:90]
+        logger.info(f"直接连不上 {host}（{why}），改走这台电脑上设的代理，连上了" if order[1] == "proxy"
+                    else f"经这台电脑上设的代理连不上 {host}（{why}），改成直接连，连上了")
+    return resp
+
+
+def _open_local(req, timeout: float, ssl_context):
+    """连这台电脑上的客户端 / 游戏（127.0.0.1）：永远不走代理。系统里设了代理、又没把本机地址排除在外的电脑上，
+    Python 会把这些请求也交给代理，代理再绕回本机，绕不回来就读不到客户端 / 游戏"""
+    opener = _LOCAL_OPENERS.get(id(ssl_context))
+    if opener is None:
+        if len(_LOCAL_OPENERS) > 4:                   # 每次重连客户端都是一份新的证书设置：旧的不留
+            _LOCAL_OPENERS.clear()
+        opener = _LOCAL_OPENERS[id(ssl_context)] = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ssl_context))
+    return opener.open(req, timeout=timeout)
 
 
 def _http_json(method: str, url: str, headers: dict, body: dict | None = None,
@@ -458,8 +547,7 @@ def _http_json(method: str, url: str, headers: dict, body: dict | None = None,
         hdrs["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
     try:
-        with (_open(req, timeout) if ssl_context is None
-              else urllib.request.urlopen(req, timeout=timeout, context=ssl_context)) as resp:
+        with (_open(req, timeout) if ssl_context is None else _open_local(req, timeout, ssl_context)) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as e:
         raw = e.read() or b""
@@ -579,7 +667,7 @@ class LCU:
         """读一个文件的原始内容（比如英雄头像图），不当 JSON 解析"""
         req = urllib.request.Request(self.base + path, headers=self.headers)
         try:
-            with urllib.request.urlopen(req, timeout=timeout, context=self.ctx) as resp:
+            with _open_local(req, timeout, self.ctx) as resp:
                 return resp.read()
         except urllib.error.HTTPError as e:
             raise HttpError(e.code, "") from None
@@ -786,6 +874,7 @@ def feature_flags(config: dict, gui: bool) -> str:
 class BotAPI:
     def __init__(self, server: str, token: str):
         self.server = server.rstrip("/")
+        DIRECT_FIRST_HOSTS.add(urllib.parse.urlsplit(self.server).hostname or "")     # 连机器人先直连（见 _open）
         self.headers = {"Authorization": f"Bearer {token}"}
         self.config: dict | None = None    # main() 填上以后，ping 时顺带报开关状态；没填就不报
         self.gui = False
@@ -1603,6 +1692,9 @@ class Companion:
                     logger.error("机器人拒绝了这个令牌（401）。请在 Discord 用 /插件令牌 查看令牌。")
                     return "unauthorized"
                 logger.warning(f"连接机器人失败（第 {attempt} 次）: {e}")
+                if attempt == 1 and e.status in (502, 503, 504):
+                    logger.warning("这个回应多半不是机器人给的，是中间的代理或网关替它回的：电脑上开着代理、加速器的话，"
+                                   "先关掉再试一次")
             except Exception as e:
                 logger.warning(f"连接机器人失败（第 {attempt} 次）: {e}")
             time.sleep(5)
